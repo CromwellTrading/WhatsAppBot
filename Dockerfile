@@ -1,31 +1,19 @@
-# Dockerfile - Recomendado para Render (estable y simple)
-FROM node:20-bullseye-slim
+FROM node:18-alpine
 
 ENV NODE_ENV=production
 ENV PORT=3000
-ENV AUTH_DIR=/usr/src/app/baileys_auth
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    ca-certificates \
-    tini \
-  && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
-RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+# Instalar solo lo necesario
+RUN apk add --no-cache tini
 
-WORKDIR /usr/src/app
-
-COPY package.json package-lock.json* ./
-
-RUN npm install --omit=dev --no-progress
+COPY package*.json ./
+RUN npm ci --only=production
 
 COPY . .
 
-RUN mkdir -p ${AUTH_DIR} && chown -R appuser:appgroup /usr/src/app
+USER node
 
-EXPOSE 3000
-
-USER appuser
-
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "mod-bot-baileys-full.js"]
