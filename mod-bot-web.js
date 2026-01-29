@@ -1,27 +1,28 @@
+// mod-bot-web.js
+// Bot guardián WhatsApp + Supabase session-sync para Render (sin disco persistente)
 const express = require('express');
 const cron = require('node-cron');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Validar variables de entorno críticas
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('❌ ERROR: Variables de entorno SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY son requeridas');
-  process.exit(1);
-}
-
-// --- CONFIGURACIÓN SUPABASE ---
+// --- CONFIG SUPABASE ---
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // NOTE: service role required for upsert/select
+if (!supabaseUrl || !supabaseKey) {
+  console.error('Falta SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en env vars.');
+}
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// --- CONFIGURACIÓN BOT ---
-const GROUP_ID = process.env.GROUP_ID; 
-const MAX_WARNINGS = 3;
+// --- CONFIG BOT ---
+const GROUP_ID = process.env.GROUP_ID || null;
+const MAX_WARNINGS = parseInt(process.env.MAX_WARNINGS || '3', 10);
 const AUTO_MESSAGES = [
   "¡Hola grupo! Recuerden las reglas.",
   "Bot Guardián activo. Eviten enviar enlaces.",
@@ -29,39 +30,94 @@ const AUTO_MESSAGES = [
   "🤖 Protegiendo el grupo 24/7."
 ];
 
-// Configuración optimizada de Puppeteer
-const puppeteerOptions = {
-  headless: 'new', // Usar el nuevo headless
-  executablePath: process.env.CHROME_PATH || '/usr/bin/chromium',
-  args: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--disable-software-rasterizer',
-    '--disable-background-timer-throttling',
-    '--disable-backgrounding-occluded-windows',
-    '--disable-renderer-backgrounding',
-    '--single-process' // Para reducir uso de memoria en Render
-  ]
-};
+// --- AUTH DIR (LocalAuth) ---
+const AUTH_DIR = path.join(__dirname, 'wwebjs_auth'); // carpeta efímera en Render
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
+// --- Supabase <-> Auth sync functions (base64) ---
+async function downloadAuthFromSupabase() {
+  try {
+    const { data, error } = await supabase
+      .from('wa_session_files')
+      .select('file_name, file_b64');
+
+    if (error) {
+      console.error('Supabase downloadAuth error:', error);
+      return;
+    }
+    if (!data || data.length === 0) {
+      console.log('No hay archivos de sesión en Supabase.');
+      return;
+    }
+
+    for (const row of data) {
+      const filePath = path.join(AUTH_DIR, row.file_name);
+      const dir = path.dirname(filePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(filePath, Buffer.from(row.file_b64, 'base64'));
+    }
+    console.log('✅ Sesión restaurada desde Supabase a', AUTH_DIR);
+  } catch (e) {
+    console.error('Error descargando sesión desde Supabase:', e);
+  }
+}
+
+async function uploadAuthToSupabase() {
+  try {
+    const files = [];
+    const walk = (dir) => {
+      const items = fs.readdirSync(dir, { withFileTypes: true });
+      for (const it of items) {
+        const full = path.join(dir, it.name);
+        if (it.isDirectory()) walk(full);
+        else {
+          const rel = path.relative(AUTH_DIR, full).replace(/\\/g, '/');
+          const b64 = fs.readFileSync(full).toString('base64');
+          files.push({ file_name: rel, file_b64: b64 });
+        }
+      }
+    };
+    if (fs.existsSync(AUTH_DIR)) walk(AUTH_DIR);
+    if (files.length === 0) {
+      console.warn('No se detectaron archivos en', AUTH_DIR);
+      return;
+    }
+
+    // upsert (onConflict file_name) requiere file_name PK en la tabla
+    const { error } = await supabase
+      .from('wa_session_files')
+      .upsert(files, { onConflict: ['file_name'] });
+
+    if (error) console.error('Supabase uploadAuth error:', error);
+    else console.log(`✅ Sesión subida a Supabase (${files.length} archivos)`);
+  } catch (e) {
+    console.error('Error subiendo sesión a Supabase:', e);
+  }
+}
+
+// --- WHATSAPP CLIENT (LocalAuth usa AUTH_DIR) ---
 const client = new Client({
-  authStrategy: new LocalAuth({ 
-    clientId: "moderator-bot",
-    dataPath: './wwebjs_auth' // Directorio explícito
-  }),
-  puppeteer: puppeteerOptions,
-  webVersionCache: {
-    type: 'remote',
-    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html'
+  authStrategy: new LocalAuth({ clientId: "moderator-bot", dataPath: AUTH_DIR }),
+  puppeteer: {
+    headless: true,
+    executablePath: process.env.CHROME_PATH || '/usr/bin/chromium',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--single-process',
+      '--no-zygote',
+      '--no-first-run',
+      '--no-default-browser-check'
+    ]
   }
 });
 
 let lastQr = null;
 let clientReady = false;
 
-// 1. EVENTOS DE CONEXIÓN
+// Eventos
 client.on('qr', (qr) => {
   lastQr = qr;
   clientReady = false;
@@ -69,225 +125,154 @@ client.on('qr', (qr) => {
   console.log('⚠️ NUEVO QR GENERADO.');
 });
 
-client.on('ready', () => {
-  lastQr = null;
-  clientReady = true;
-  console.log('🚀 BOT LISTO Y CONECTADO');
+client.on('authenticated', () => {
+  console.log('🔐 Autenticado.');
 });
 
 client.on('auth_failure', (msg) => {
-  console.error('❌ Error de autenticación:', msg);
+  console.error('❌ Falló autenticación:', msg);
 });
 
-client.on('disconnected', (reason) => {
-  console.log('🔌 Cliente desconectado:', reason);
-  clientReady = false;
+client.on('ready', async () => {
+  lastQr = null;
+  clientReady = true;
+  console.log('🚀 BOT LISTO Y CONECTADO');
+
+  // subir sesión a Supabase para persistencia entre deploys
+  try {
+    await uploadAuthToSupabase();
+  } catch (e) {
+    console.error('Error subiendo sesión tras ready:', e);
+  }
 });
 
-// 2. LÓGICA DE MODERACIÓN MEJORADA
+// Moderación: borrar enlaces, warn count en supabase, expulsar si excede
 client.on('message_create', async (msg) => {
   try {
-    // Ignorar mensajes del bot
-    if (msg.fromMe) return;
-    
     const chat = await msg.getChat();
-    
-    // Solo moderar grupos
-    if (!chat.isGroup) return;
-    
-    // Logs informativos
+    if (!chat) return;
+
     if (msg.body) {
-      const contact = await msg.getContact();
-      console.log(`📩 [${chat.name}] ${contact.pushname || contact.number}: ${msg.body.substring(0, 50)}`);
+      console.log(`📩 [${chat.name || chat.id._serialized}] ${msg.author || msg.from}: ${msg.body.substring(0, 120)}`);
+      console.log(`🆔 ID Grupo: ${chat.id._serialized}`);
     }
 
-    // Detectar enlaces (con mejor regex)
-    const linkRegex = /(https?:\/\/[^\s]+|www\.[^\s]+\.[^\s]+)/gi;
-    if (linkRegex.test(msg.body)) {
-      const senderId = msg.author || msg.from;
-      
-      // Delay aleatorio para parecer humano
-      const delay = Math.floor(Math.random() * (45000 - 20000) + 20000);
-      
-      setTimeout(async () => {
+    if (!chat.isGroup || msg.fromMe) return;
+
+    const hasLink = /https?:\/\/|www\.[^\s]+/i.test(msg.body || '');
+    if (!hasLink) return;
+
+    const senderId = msg.author || msg.from;
+    const delay = Math.floor(Math.random() * (30000 - 15000 + 1)) + 15000;
+
+    setTimeout(async () => {
+      try {
         try {
-          // Intentar eliminar el mensaje
-          const deleteResult = await msg.delete(true);
-          if (!deleteResult) {
-            console.log('⚠️ No se pudo eliminar el mensaje');
-            return;
+          await msg.delete(true);
+          console.log(`🗑️ Mensaje borrado de ${senderId}`);
+        } catch (err) {
+          console.warn('No se pudo borrar el mensaje (¿es el bot admin?). Error:', err.message || err);
+        }
+
+        // seleccionar advertencias
+        const { data: userRow, error: selError } = await supabase
+          .from('warnings')
+          .select('warn_count')
+          .eq('user_id', senderId)
+          .single();
+
+        if (selError && selError.code !== 'PGRST116') {
+          console.error('Supabase select error:', selError);
+        }
+
+        let currentWarns = (userRow ? userRow.warn_count : 0) + 1;
+
+        if (!userRow) {
+          const { error: insErr } = await supabase.from('warnings').insert([{ user_id: senderId, warn_count: 1 }]);
+          if (insErr) console.error('Supabase insert error:', insErr);
+        } else {
+          const { error: upErr } = await supabase.from('warnings').update({ warn_count: currentWarns }).eq('user_id', senderId);
+          if (upErr) console.error('Supabase update error:', upErr);
+        }
+
+        let contact;
+        try { contact = await client.getContactById(senderId); } catch (e) { contact = null; }
+        const mentionText = contact ? `@${contact.number}` : `@${senderId.replace('@c.us', '')}`;
+
+        if (currentWarns < MAX_WARNINGS) {
+          try {
+            await chat.sendMessage(`⚠️ ${mentionText} ¡No enlaces! Advertencia ${currentWarns}/${MAX_WARNINGS}`, { mentions: contact ? [contact] : [] });
+          } catch (e) {
+            console.warn('No se pudo enviar advertencia con mención:', e.message || e);
+            await chat.sendMessage(`⚠️ ${mentionText} ¡No enlaces! Advertencia ${currentWarns}/${MAX_WARNINGS}`);
           }
-          
-          console.log(`🗑️ Mensaje eliminado de ${senderId}`);
-          
-          // Obtener contacto para mención
-          const contact = await client.getContactById(senderId);
-          const mention = `@${senderId.replace('@c.us', '')}`;
-          
-          // --- GESTIÓN DE ADVERTENCIAS ---
-          let { data: userRow, error } = await supabase
-            .from('warnings')
-            .select('warn_count')
-            .eq('user_id', senderId)
-            .single();
-
-          if (error && error.code !== 'PGRST116') { // PGRST116 = no encontrado
-            console.error('Error al buscar advertencias:', error);
-            return;
-          }
-
-          let currentWarns = (userRow ? userRow.warn_count : 0) + 1;
-          console.log(`⚠️ Advertencia ${currentWarns}/${MAX_WARNINGS} para ${senderId}`);
-
-          if (!userRow) {
-            // Primera advertencia
-            const { error: insertError } = await supabase
-              .from('warnings')
-              .insert([{ 
-                user_id: senderId, 
-                warn_count: 1,
-                created_at: new Date().toISOString()
-              }]);
-            
-            if (insertError) {
-              console.error('Error al insertar advertencia:', insertError);
-            }
-          } else {
-            // Actualizar advertencia existente
-            const { error: updateError } = await supabase
-              .from('warnings')
-              .update({ 
-                warn_count: currentWarns,
-                updated_at: new Date().toISOString()
-              })
-              .eq('user_id', senderId);
-            
-            if (updateError) {
-              console.error('Error al actualizar advertencia:', updateError);
-            }
-          }
-
-          // Enviar advertencia o banear
-          if (currentWarns < MAX_WARNINGS) {
-            await chat.sendMessage(
-              `⚠️ ${mention} ¡No se permiten enlaces! Advertencia ${currentWarns}/${MAX_WARNINGS}\n` +
-              `La próxima será ban.`,
-              { mentions: [contact] }
-            );
-          } else {
-            await chat.sendMessage(
-              `🚫 ${mention} Baneado por acumular ${MAX_WARNINGS} advertencias.`,
-              { mentions: [contact] }
-            );
-            
-            // Eliminar de la base de datos
-            await supabase
-              .from('warnings')
-              .delete()
-              .eq('user_id', senderId);
-            
-            // Expulsar del grupo con delay
+        } else {
+          try {
+            await chat.sendMessage(`🚫 ${mentionText} Baneado por spam.`, { mentions: contact ? [contact] : [] });
             setTimeout(async () => {
               try {
                 await chat.removeParticipants([senderId]);
-                console.log(`👢 Usuario ${senderId} expulsado del grupo`);
-              } catch (expulsionError) {
-                console.error('Error al expulsar usuario:', expulsionError);
+                console.log(`👢 Usuario ${senderId} expulsado.`);
+              } catch (e) {
+                console.error('No se pudo expulsar al usuario (¿es el bot admin?).', e.message || e);
               }
-            }, 3000);
+            }, 2000);
+            const { error: delErr } = await supabase.from('warnings').delete().eq('user_id', senderId);
+            if (delErr) console.error('Error al borrar advertencias en Supabase:', delErr);
+          } catch (e) {
+            console.error('Error al manejar baneo:', e);
           }
-        } catch (e) { 
-          console.error('Error en moderación:', e.message);
         }
-      }, delay);
-    }
-  } catch (e) { 
-    console.error('Error general en mensaje:', e.message);
+      } catch (e) {
+        console.error('Error moderando (interno):', e);
+      }
+    }, delay);
+  } catch (e) {
+    console.error('Error general:', e);
   }
 });
 
-// 3. AUTO POST MEJORADO
+// AUTO POST horario
 cron.schedule('0 * * * *', async () => {
-  if (!clientReady || !GROUP_ID) {
-    console.log('⏸️ Auto-mensaje omitido: Bot no listo o sin GROUP_ID');
-    return;
-  }
-  
-  try {
-    const chat = await client.getChatById(GROUP_ID);
-    const randomMessage = AUTO_MESSAGES[Math.floor(Math.random() * AUTO_MESSAGES.length)];
-    await chat.sendMessage(randomMessage);
-    console.log(`🤖 Auto-mensaje enviado: "${randomMessage.substring(0, 30)}..."`);
-  } catch (error) {
-    console.error('Error enviando auto-mensaje:', error.message);
-  }
-});
-
-// RUTAS WEB MEJORADAS
-app.get('/qr', async (req, res) => {
-  try {
-    if (lastQr) {
-      res.setHeader('Content-Type', 'image/png');
-      await QRCode.toFileStream(res, lastQr, {
-        width: 300,
-        margin: 2,
-        errorCorrectionLevel: 'H'
-      });
-    } else if (clientReady) {
-      res.send('<html><body><h2>✅ Bot ya está conectado</h2><p>No necesita QR</p></body></html>');
-    } else {
-      res.send(`
-        <html>
-          <head>
-            <meta http-equiv="refresh" content="10">
-            <title>QR Code</title>
-          </head>
-          <body>
-            <h2>⏳ Generando QR...</h2>
-            <p>Actualizando automáticamente cada 10 segundos</p>
-          </body>
-        </html>
-      `);
+  if (clientReady && GROUP_ID) {
+    try {
+      const chat = await client.getChatById(GROUP_ID);
+      if (chat) {
+        const msg = AUTO_MESSAGES[Math.floor(Math.random() * AUTO_MESSAGES.length)];
+        await chat.sendMessage(msg);
+        console.log('🤖 Mensaje automático enviado:', msg);
+      }
+    } catch (e) {
+      console.error('Error enviando auto-mensaje:', e);
     }
-  } catch (error) {
-    res.status(500).send('Error generando QR');
   }
 });
 
-app.get('/status', (req, res) => {
-  res.json({
-    status: clientReady ? 'connected' : 'disconnected',
-    qr_required: !clientReady && !!lastQr,
-    uptime: process.uptime(),
-    memory: process.memoryUsage()
+// Rutas web
+app.get('/qr', async (req, res) => {
+  if (lastQr) {
+    res.setHeader('Content-Type', 'image/png');
+    try {
+      await QRCode.toFileStream(res, lastQr);
+    } catch (e) {
+      console.error('Error generando QR PNG:', e);
+      res.status(500).send('Error generando QR');
+    }
+  } else {
+    res.send('<html><head><meta http-equiv="refresh" content="5"></head><body>Cargando QR... (si lleva mucho tiempo, revisa logs)</body></html>');
+  }
+});
+
+app.get('/', (req, res) => res.send('Bot Guardián Online'));
+
+(async () => {
+  // Restaurar sesión desde Supabase (si existe)
+  await downloadAuthFromSupabase();
+
+  // Inicializar cliente
+  client.initialize();
+
+  app.listen(PORT, () => {
+    console.log(`Puerto ${PORT}`);
   });
-});
-
-app.get('/', (req, res) => {
-  res.send(`
-    <html>
-      <body>
-        <h1>🤖 Bot Guardián Online</h1>
-        <p>Estado: ${clientReady ? '✅ Conectado' : '❌ Desconectado'}</p>
-        <ul>
-          <li><a href="/qr">Ver QR Code</a></li>
-          <li><a href="/status">Estado del Bot</a></li>
-        </ul>
-      </body>
-    </html>
-  `);
-});
-
-// Manejo de errores global
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-});
-
-// Iniciar servidor y bot
-app.listen(PORT, () => {
-  console.log(`🌐 Servidor web en puerto ${PORT}`);
-  console.log(`📱 Inicializando bot de WhatsApp...`);
-  client.initialize().catch(err => {
-    console.error('Error inicializando cliente:', err);
-  });
-});
+})();
