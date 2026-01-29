@@ -1,19 +1,31 @@
-FROM node:18-alpine
+FROM node:20-bullseye-slim
 
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV AUTH_DIR=/usr/src/app/baileys_auth
 
-WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    tini \
+  && rm -rf /var/lib/apt/lists/*
 
-# Instalar solo lo necesario
-RUN apk add --no-cache tini
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 
-COPY package*.json ./
-RUN npm ci --only=production
+WORKDIR /usr/src/app
+
+COPY package.json package-lock.json* ./
+
+# CAMBIO CRÍTICO: Usa npm install, NO npm ci
+RUN npm install --omit=dev --no-progress
 
 COPY . .
 
-USER node
+RUN mkdir -p ${AUTH_DIR} && chown -R appuser:appgroup /usr/src/app
 
-ENTRYPOINT ["/sbin/tini", "--"]
+EXPOSE 3000
+
+USER appuser
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "mod-bot-baileys-full.js"]
