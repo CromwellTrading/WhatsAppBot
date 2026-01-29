@@ -1,5 +1,6 @@
 // mod-bot-web.js
-// Bot guardián WhatsApp + Supabase session-sync (Opción A: console.log IDGRP inmediato)
+// Versión fuerte: detecta TODO lo que hace el dispositivo vinculado + mensajes entrantes
+// Incluye: sync Supabase session, moderación (borrar enlaces, warnings, expulsar), y logs claros.
 const express = require('express');
 const cron = require('node-cron');
 const { Client, LocalAuth } = require('whatsapp-web.js');
@@ -124,7 +125,17 @@ process.on('uncaughtException', (err) => {
   console.error('uncaughtException:', err.stack || err);
 });
 
-// Client events
+// Helper de log claro (Render captura stdout)
+function logSimple(prefix, stuff) {
+  try {
+    const now = new Date().toISOString();
+    console.log(`${now} ${prefix} ${JSON.stringify(stuff)}`);
+  } catch (e) {
+    console.log('LOG ERR', prefix, stuff);
+  }
+}
+
+// Client events: qr/auth/ready
 client.on('qr', (qr) => {
   lastQr = qr;
   clientReady = false;
@@ -152,24 +163,28 @@ client.on('ready', async () => {
   }
 });
 
-// Moderación: eliminar enlaces, warnings, expulsar si alcanza MAX_WARNINGS
-client.on('message_create', async (msg) => {
+// ------------------ EVENT LISTENERS PARA CAPTURAR TODO ------------------
+
+// 1) Mensajes entrantes (reliable for received messages)
+client.on('message', async (msg) => {
   try {
-    const chat = await msg.getChat();
-    if (!chat) return;
-
-    // Snippet y autor para el log inmediato
-    const snippetRaw = (msg.body || '').replace(/\n/g, ' ');
-    const snippet = snippetRaw.length > 300 ? snippetRaw.substring(0, 300) + '...' : snippetRaw || '[no-text]';
-    const chatName = chat.name || chat.id._serialized;
+    const chat = await msg.getChat().catch(() => null);
+    const chatId = chat ? chat.id._serialized : (msg.from || '[unknown]');
+    const chatName = chat ? (chat.name || chatId) : chatId;
     const author = msg.author || msg.from;
+    const fromMe = !!msg.fromMe;
+    const body = (msg.body || '').replace(/\n/g, ' ').substring(0, 800);
 
-    // ======= LÍNEA PRIORITARIA: ID DEL GRUPO (buscar "IDGRP" en logs de Render) =======
-    console.log(`IDGRP ${chat.id._serialized} | CHAT "${chatName}" | FROM ${author} | SNIPPET ${snippet}`);
-    // ====================================================================================
+    // Línea prioritaria para buscar en Render: IDGRP
+    console.log(`IDGRP ${chatId} | EVENT message | fromMe:${fromMe} | author:${author} | CHAT "${chatName}" | MSG "${body}"`);
 
-    if (!chat.isGroup || msg.fromMe) return;
+    // ----------------------------------------------------------------
+    // Conserva la misma lógica de moderación: solo actúa en grupos y si no es del bot
+    // Para no duplicar acciones, si el msg fue creado por el cliente (fromMe true) 
+    // evitamos volver a procesar la moderación que también se maneja en message_create.
+    if (!chat || !chat.isGroup || msg.fromMe) return;
 
+    // Detección enlaces y resto de la lógica (idéntica a la que ya tenías)
     const hasLink = /https?:\/\/|www\.[^\s]+/i.test(msg.body || '');
     if (!hasLink) return;
 
@@ -180,12 +195,11 @@ client.on('message_create', async (msg) => {
       try {
         try {
           await msg.delete(true);
-          console.log(`Mensaje borrado de ${senderId} en ${chat.id._serialized}`);
+          console.log(`Mensaje borrado de ${senderId} en ${chatId}`);
         } catch (err) {
           console.warn('No se pudo borrar el mensaje (¿es el bot admin?). Error:', err.message || err);
         }
 
-        // Gestionar warnings en Supabase
         const { data: userRow, error: selError } = await supabase
           .from('warnings')
           .select('warn_count')
@@ -224,7 +238,7 @@ client.on('message_create', async (msg) => {
             setTimeout(async () => {
               try {
                 await chat.removeParticipants([senderId]);
-                console.log(`Usuario ${senderId} expulsado del chat ${chat.id._serialized}`);
+                console.log(`Usuario ${senderId} expulsado del chat ${chatId}`);
               } catch (e) {
                 console.error('No se pudo expulsar al usuario (¿es el bot admin?).', e.message || e);
               }
@@ -239,12 +253,55 @@ client.on('message_create', async (msg) => {
         console.error('Error moderando (interno):', e);
       }
     }, delay);
+
   } catch (e) {
-    console.error('Error general en message_create:', e);
+    console.error('Error en handler message:', e);
   }
 });
 
-// Auto post horario
+// 2) Mensajes creados por el cliente (este captura cosas que el cliente genera localmente)
+client.on('message_create', async (msg) => {
+  try {
+    const chat = await msg.getChat().catch(() => null);
+    const chatId = chat ? chat.id._serialized : (msg.from || '[unknown]');
+    const chatName = chat ? (chat.name || chatId) : chatId;
+    const author = msg.author || msg.from;
+    const fromMe = !!msg.fromMe;
+    const body = (msg.body || '').replace(/\n/g, ' ').substring(0, 800);
+
+    // Línea clara para buscar: CREATED
+    console.log(`CREATED ${chatId} | fromMe:${fromMe} | author:${author} | CHAT "${chatName}" | MSG "${body}"`);
+
+    // No volvemos a ejecutar la moderación aquí (para evitar duplicados) - la moderación se maneja en 'message' cuando corresponde.
+  } catch (e) {
+    console.error('Error en handler message_create:', e);
+  }
+});
+
+// 3) ACKs de mensajes (útil para ver que el dispositivo envió/recibió ack)
+client.on('message_ack', (msg, ack) => {
+  try {
+    // ack codes: 0 - ACK_TYPE_PENDING? ; 1 - SENT, 2 - DELIVERED, 3 - READ (puede variar)
+    const chatId = msg?.from || '[unknown]';
+    console.log(`ACK ${chatId} | msgId:${msg?.id?._serialized} | fromMe:${!!msg?.fromMe} | ack:${ack}`);
+  } catch (e) {
+    console.error('Error en message_ack:', e);
+  }
+});
+
+// 4) Revoke events (mensaje eliminado por usuario)
+client.on('message_revoke_everyone', async (after, before) => {
+  try {
+    // after = message AFTER revoke (maybe null), before = message BEFORE revoke (the deleted msg)
+    const beforeBody = before && before.body ? before.body.replace(/\n/g, ' ').substring(0, 400) : '[no-body]';
+    const chatId = (before && before.from) || (after && after.from) || '[unknown]';
+    console.log(`REVOKE ${chatId} | deleted-msg-snippet: "${beforeBody}"`);
+  } catch (e) {
+    console.error('Error en message_revoke_everyone:', e);
+  }
+});
+
+// ------------------ AUTO POST (mantengo) ------------------
 cron.schedule('0 * * * *', async () => {
   if (clientReady && GROUP_ID) {
     try {
@@ -260,7 +317,7 @@ cron.schedule('0 * * * *', async () => {
   }
 });
 
-// Rutas web: /qr y /
+// RUTAS web: /qr y /
 app.get('/qr', async (req, res) => {
   if (lastQr) {
     res.setHeader('Content-Type', 'image/png');
@@ -277,6 +334,7 @@ app.get('/qr', async (req, res) => {
 
 app.get('/', (req, res) => res.send('Bot Guardián Online'));
 
+// Iniciar: restaurar sesión y arrancar cliente
 (async () => {
   await downloadAuthFromSupabase();
   client.initialize();
