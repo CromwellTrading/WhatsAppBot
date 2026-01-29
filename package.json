@@ -1,19 +1,27 @@
 {
-  "name": "whatsapp-mod-bot",
+  "name": "whatsapp-moderator-bot",
   "version": "1.0.0",
+  "description": "Bot guardián para grupos de WhatsApp con Supabase y Render",
   "main": "mod-bot-web.js",
   "scripts": {
-    "start": "node mod-bot-web.js"
+    "start": "node mod-bot-web.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.39.3",
     "body-parser": "^1.20.2",
     "express": "^4.18.2",
     "fs-extra": "^11.2.0",
     "node-cron": "^3.0.3",
-    "pg": "^8.11.3",
-    "puppeteer": "^22.0.0",
+    "path": "^0.12.7",
+    "puppeteer": "^21.11.0",
     "qrcode": "^1.5.3",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.25.0"
-  }
+    "whatsapp-web.js": "latest"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Gemini AI",
+  "license": "ISC"
 }
