@@ -1,231 +1,349 @@
-// mod-bot-web.js
-// Bot Guardián WhatsApp + Supabase session-sync
-// Captura TODOS los mensajes + debug fuerte para Render
+// mod-bot-baileys-full.js
+// Bot Guardián LIGERO con Baileys + Supabase
+// - Detecta enlaces, advierte y expulsa al alcanzar MAX_WARNINGS
+// - Persiste credencial en archivo y en Supabase
+// - Endpoints: /qr, /status, /chats, /test/:chatId/:message
+// - Cron para mensajes automáticos
+// -------------------------------------------------------
 
 const express = require('express');
 const cron = require('node-cron');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
-const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
 const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
+
+const {
+  default: makeWASocket,
+  DisconnectReason,
+  useSingleFileAuthState,
+  fetchLatestBaileysVersion,
+  makeInMemoryStore
+} = require('@adiwajshing/baileys');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ==================== SUPABASE ====================
+// ---------------- CONFIG ----------------
+const AUTH_DIR = path.join(__dirname, 'baileys_auth');
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+const AUTH_FILE = path.join(AUTH_DIR, 'auth_info_multi.json');
+
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-if (!supabaseUrl || !supabaseKey) {
-  console.error('❌ FALTAN ENV VARS DE SUPABASE');
-}
-
+if (!supabaseUrl || !supabaseKey) console.warn('⚠️ Falta SUPABASE env vars');
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// ==================== CONFIG BOT ====================
-const GROUP_ID = process.env.GROUP_ID || null;
+const GROUP_ID = process.env.GROUP_ID || null; // ej: '123456789-123456789@g.us'
 const MAX_WARNINGS = parseInt(process.env.MAX_WARNINGS || '3', 10);
-
 const AUTO_MESSAGES = [
-  "🤖 Bot guardián activo.",
-  "Recuerden respetar las reglas.",
-  "Protegiendo el grupo 24/7."
+  "🤖 Bot guardián activo (Baileys).",
+  "Recuerden respetar las reglas del grupo.",
+  "Mensaje automático: eviten enlaces."
 ];
 
-// ==================== AUTH DIR ====================
-const AUTH_DIR = path.join(__dirname, 'wwebjs_auth');
-if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+// ---------------- AUTH (archivo) ----------------
+const { state, saveState } = useSingleFileAuthState(AUTH_FILE);
 
-// ==================== UTIL ====================
-function listAuthFiles() {
-  const files = [];
-  if (!fs.existsSync(AUTH_DIR)) return files;
+// ---------------- STORE ----------------
+const store = makeInMemoryStore({});
 
-  const walk = (dir) => {
-    const items = fs.readdirSync(dir, { withFileTypes: true });
-    for (const it of items) {
-      const full = path.join(dir, it.name);
-      if (it.isDirectory()) walk(full);
-      else files.push(path.relative(AUTH_DIR, full).replace(/\\/g, '/'));
-    }
-  };
-  walk(AUTH_DIR);
-  return files;
+// ---------------- UTIL ----------------
+function isGroupJid(jid) {
+  return typeof jid === 'string' && jid.endsWith('@g.us');
 }
 
-// ==================== SUPABASE SYNC ====================
-async function downloadAuthFromSupabase() {
-  console.log('⬇️ Restaurando sesión desde Supabase...');
-  const { data, error } = await supabase
-    .from('wa_session_files')
-    .select('file_name, file_b64');
-
-  if (error) {
-    console.error('❌ Error Supabase restore:', error);
-    return;
-  }
-
-  if (!data || data.length === 0) {
-    console.log('ℹ️ No hay sesión guardada en Supabase');
-    return;
-  }
-
-  for (const row of data) {
-    const filePath = path.join(AUTH_DIR, row.file_name);
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, Buffer.from(row.file_b64, 'base64'));
-  }
-
-  console.log('✅ Sesión restaurada. Archivos:', listAuthFiles());
+function safeTextFromMessage(msg) {
+  if (!msg) return '';
+  if (msg.message?.conversation) return msg.message.conversation;
+  if (msg.message?.extendedTextMessage?.text) return msg.message.extendedTextMessage.text;
+  if (msg.message?.imageMessage?.caption) return msg.message.imageMessage.caption;
+  if (msg.message?.documentMessage?.caption) return msg.message.documentMessage.caption;
+  if (msg.message?.videoMessage?.caption) return msg.message.videoMessage.caption;
+  return '[NO-TEXTO]';
 }
 
+// ---------------- SUPABASE: auth persist ----------------
 async function uploadAuthToSupabase() {
-  const files = listAuthFiles();
-  if (files.length === 0) {
-    console.warn('⚠️ No hay archivos para subir a Supabase');
-    return;
+  try {
+    if (!fs.existsSync(AUTH_FILE)) {
+      console.warn('No auth file para subir a Supabase.');
+      return;
+    }
+    const b64 = fs.readFileSync(AUTH_FILE).toString('base64');
+    const payload = [{ key: 'baileys_auth', auth_b64: b64 }];
+    const { error } = await supabase.from('wa_session_json').upsert(payload, { onConflict: ['key'] });
+    if (error) console.error('Error subiendo auth a Supabase:', error);
+    else console.log('✅ Auth subido a Supabase');
+  } catch (e) {
+    console.error('Error uploadAuthToSupabase:', e);
   }
-
-  const payload = files.map(f => ({
-    file_name: f,
-    file_b64: fs.readFileSync(path.join(AUTH_DIR, f)).toString('base64')
-  }));
-
-  const { error } = await supabase
-    .from('wa_session_files')
-    .upsert(payload, { onConflict: ['file_name'] });
-
-  if (error) console.error('❌ Error subiendo sesión:', error);
-  else console.log(`✅ Sesión subida a Supabase (${files.length} archivos)`);
 }
 
-// ==================== WHATSAPP CLIENT ====================
-const client = new Client({
-  authStrategy: new LocalAuth({
-    clientId: 'moderator-bot',
-    dataPath: AUTH_DIR
-  }),
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote'
-    ]
-  }
-});
-
-let lastQr = null;
-let clientReady = false;
-
-// ==================== PROCESS ERRORS ====================
-process.on('unhandledRejection', r => console.error('unhandledRejection:', r));
-process.on('uncaughtException', e => console.error('uncaughtException:', e));
-
-// ==================== CLIENT EVENTS ====================
-client.on('qr', qr => {
-  lastQr = qr;
-  clientReady = false;
-  console.log('⚠️ NUEVO QR GENERADO');
-  qrcodeTerminal.generate(qr, { small: true });
-});
-
-client.on('authenticated', async () => {
-  console.log('🔐 AUTENTICADO');
-  console.log('📂 Archivos auth:', listAuthFiles());
-  await uploadAuthToSupabase(); // CLAVE
-});
-
-client.on('auth_failure', msg => {
-  console.error('❌ AUTH FAILURE:', msg);
-});
-
-client.on('ready', async () => {
-  clientReady = true;
-  lastQr = null;
-  console.log('🚀 BOT LISTO Y CONECTADO');
-
-  const chats = await client.getChats();
-  console.log(`📱 Chats cargados: ${chats.length}`);
-
-  await uploadAuthToSupabase();
-});
-
-client.on('change_state', state => {
-  console.log('🔄 STATE CHANGED:', state);
-});
-
-client.on('disconnected', reason => {
-  console.error('🔌 CLIENT DISCONNECTED:', reason);
-});
-
-// ==================== MENSAJES ====================
-client.on('message_create', async msg => {
-  console.log(`📨 ${msg.from} | ${msg.type} | ${msg.body?.slice(0, 80)}`);
-});
-
-// ==================== CRON ====================
-cron.schedule('0 * * * *', async () => {
-  if (!clientReady || !GROUP_ID) return;
+async function downloadAuthFromSupabase() {
   try {
-    const chat = await client.getChatById(GROUP_ID);
-    const msg = AUTO_MESSAGES[Math.floor(Math.random() * AUTO_MESSAGES.length)];
-    await chat.sendMessage(msg);
+    const { data, error } = await supabase.from('wa_session_json').select('auth_b64').eq('key', 'baileys_auth').single();
+    if (error) {
+      console.warn('No auth en Supabase o error:', error.message || error);
+      return;
+    }
+    if (!data || !data.auth_b64) return;
+    fs.mkdirSync(path.dirname(AUTH_FILE), { recursive: true });
+    fs.writeFileSync(AUTH_FILE, Buffer.from(data.auth_b64, 'base64'));
+    console.log('✅ Auth restaurado desde Supabase');
   } catch (e) {
-    console.error('❌ Cron error:', e.message);
+    console.error('Error downloadAuthFromSupabase:', e);
   }
-});
+}
 
-// ==================== WEB ====================
-app.get('/', (req, res) => {
-  res.send(`
-    <h1>Bot Guardián</h1>
-    <p>Estado: ${clientReady ? '✅ CONECTADO' : '⏳ CONECTANDO'}</p>
-    <a href="/qr">Ver QR</a>
-  `);
-});
-
-app.get('/qr', async (req, res) => {
-  if (!lastQr) {
-    return res.send('<meta http-equiv="refresh" content="5">Esperando QR...');
+// ---------------- SUPABASE: warnings table helpers ----------------
+// Tabla: warnings (user_id TEXT PK, warn_count INTEGER)
+async function getWarnCount(user_id) {
+  try {
+    const { data, error } = await supabase.from('warnings').select('warn_count').eq('user_id', user_id).single();
+    if (error && error.code !== 'PGRST116') {
+      console.error('Error getWarnCount:', error);
+      return 0;
+    }
+    return data ? data.warn_count : 0;
+  } catch (e) {
+    console.error('getWarnCount err:', e);
+    return 0;
   }
-  const dataUrl = await QRCode.toDataURL(lastQr);
-  res.send(`
-    <h2>Escanea con WhatsApp (APP móvil)</h2>
-    <img src="${dataUrl}" style="width:300px"/>
-  `);
-});
+}
 
-app.get('/chats', async (req, res) => {
-  if (!clientReady) return res.status(400).send('Cliente no listo');
-  const chats = await client.getChats();
-  res.json(chats.map(c => ({
-    id: c.id._serialized,
-    name: c.name,
-    isGroup: c.isGroup
-  })));
-});
+async function setWarnCount(user_id, count) {
+  try {
+    const { error } = await supabase.from('warnings').upsert([{ user_id, warn_count: count }], { onConflict: ['user_id'] });
+    if (error) console.error('Error setWarnCount:', error);
+  } catch (e) {
+    console.error('setWarnCount err:', e);
+  }
+}
 
-// ==================== START ====================
-(async () => {
+async function deleteWarns(user_id) {
+  try {
+    const { error } = await supabase.from('warnings').delete().eq('user_id', user_id);
+    if (error) console.error('Error deleteWarns:', error);
+  } catch (e) {
+    console.error('deleteWarns err:', e);
+  }
+}
+
+// ---------------- INICIALIZA BOT ----------------
+async function startBot() {
   await downloadAuthFromSupabase();
-  client.initialize();
-  app.listen(PORT, () => {
-    console.log(`🌐 Servidor activo en puerto ${PORT}`);
+
+  const { version, isLatest } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 2204, 13], isLatest: false }));
+  console.log('Baileys version:', version, 'isLatest?', isLatest);
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    logger: { level: 'info' }
   });
 
-  // Chequeo forzado de estado
-  setTimeout(async () => {
+  store.bind(sock.ev);
+  let lastQr = null;
+
+  // connection updates
+  sock.ev.on('connection.update', async (update) => {
     try {
-      const state = await client.getState();
-      console.log('📡 ESTADO CLIENTE:', state);
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        lastQr = qr;
+        console.log('⚠️ Nuevo QR generado. /qr disponible');
+      }
+
+      if (connection === 'open') {
+        console.log('🚀 Conectado (OPEN).');
+        // guardar credenciales
+        try { await saveState(); } catch (e) { console.warn('saveState err', e); }
+        await uploadAuthToSupabase();
+      }
+
+      if (connection === 'close') {
+        console.warn('🔌 Conexión cerrada:', lastDisconnect?.error || lastDisconnect);
+        const code = lastDisconnect?.error?.output?.statusCode;
+        if (code === DisconnectReason.loggedOut) {
+          console.warn('Sesión deslogueada. Borrando auth local para forzar nuevo QR.');
+          try { fs.unlinkSync(AUTH_FILE); } catch (e) {}
+        }
+      }
     } catch (e) {
-      console.error('❌ No se pudo obtener estado:', e.message);
+      console.error('connection.update err:', e);
     }
-  }, 20000);
-})();
+  });
+
+  // cred updates: save
+  sock.ev.on('creds.update', async () => {
+    try { await saveState(); } catch (e) { console.warn('creds.save err', e); }
+  });
+
+  // mensajes
+  sock.ev.on('messages.upsert', async (m) => {
+    try {
+      if (!m.messages || m.type === 'notify') return;
+      const msg = m.messages[0];
+      if (!msg) return;
+
+      // Ignorar mensajes de status broadcast
+      if (msg.key && msg.key.remoteJid === 'status@broadcast') return;
+
+      const remoteJid = msg.key.remoteJid; // chat id
+      const isGroup = isGroupJid(remoteJid);
+      const participant = msg.key.participant || msg.key.remoteJid; // quien envió (en grupo: participant)
+      const fromMe = !!msg.key.fromMe;
+      const body = safeTextFromMessage(msg);
+
+      // Log básico
+      console.log(`📨 [${isGroup ? 'GRUPO' : 'PRIVADO'}] ${remoteJid} | ${participant} | ${body.toString().slice(0,200)}`);
+
+      // Guardar log local
+      try {
+        fs.appendFileSync('whatsapp_logs.txt',
+          `${new Date().toISOString()} | FROM:${participant} | CHAT:${remoteJid} | GROUP:${isGroup} | FROM_ME:${fromMe} | CONTENT:${String(body).replace(/\n/g,' ')}\n`);
+      } catch (e) { /* no fatal */ }
+
+      // Moderación: sólo si es grupo y no es desde el bot (fromMe false)
+      if (isGroup && !fromMe) {
+        const hasLink = /https?:\/\/|www\.[^\s]+/i.test(String(body));
+        if (!hasLink) return;
+
+        // Intentar borrar mensaje (puede fallar si no tiene permisos)
+        try {
+          await sock.sendMessage(remoteJid, { delete: msg.key });
+          console.log('Mensaje intentado borrar (delete request enviado).');
+        } catch (e) {
+          console.warn('No se pudo borrar mensaje automáticamente:', e.message || e);
+        }
+
+        // Manejo de warnings en Supabase
+        const senderId = participant; // e.g. '123456789@s.whatsapp.net'
+        let currentWarns = await getWarnCount(senderId);
+        currentWarns = (currentWarns || 0) + 1;
+        await setWarnCount(senderId, currentWarns);
+
+        // Obtener contacto para mencionar (si está en store)
+        const mentionJids = [senderId];
+
+        if (currentWarns < MAX_WARNINGS) {
+          const warnText = `⚠️ @${senderId.split('@')[0]} ¡No enlaces! Advertencia ${currentWarns}/${MAX_WARNINGS}`;
+          try {
+            await sock.sendMessage(remoteJid, { text: warnText, mentions: mentionJids });
+            console.log(`Advertencia ${currentWarns} enviada a ${senderId}`);
+          } catch (e) {
+            console.warn('No se pudo enviar advertencia con mención:', e.message || e);
+            try { await sock.sendMessage(remoteJid, { text: warnText }); } catch (err) {}
+          }
+        } else {
+          const banText = `🚫 @${senderId.split('@')[0]} Baneado por spam (llegó a ${currentWarns}/${MAX_WARNINGS}).`;
+          try {
+            await sock.sendMessage(remoteJid, { text: banText, mentions: mentionJids });
+          } catch (e) {
+            await sock.sendMessage(remoteJid, { text: banText });
+          }
+
+          // Intentar expulsar (requiere que el bot sea admin del grupo)
+          try {
+            await sock.groupParticipantsUpdate(remoteJid, [senderId], 'remove');
+            console.log(`Usuario expulsado: ${senderId}`);
+          } catch (e) {
+            console.error('No se pudo expulsar al usuario (asegúrate bot es admin):', e.message || e);
+          }
+
+          // Borrar registro de advertencias del usuario en Supabase
+          await deleteWarns(senderId);
+        }
+      }
+
+    } catch (e) {
+      console.error('messages.upsert err:', e);
+    }
+  });
+
+  // reactions / other events (opcional)
+  sock.ev.on('messages.update', (m) => {
+    // Puedes loguear ediciones o actualizaciones aquí si te interesa
+    // console.log('messages.update', m);
+  });
+
+  // ------- Endpoints -------
+  // /qr -> muestra QR si hay uno (si la auth local existe, indica autenticado)
+  app.get('/qr', async (req, res) => {
+    if (fs.existsSync(AUTH_FILE)) {
+      return res.send(`<html><body><h3>Autenticado.</h3><p>Si quieres forzar un nuevo QR, elimina <code>auth_info_multi.json</code> y reinicia el servicio.</p></body></html>`);
+    }
+    // leer última QR desde variable (se actualiza en connection.update)
+    // NOTA: Baileys guarda el QR en memory; aquí intentamos leer desde store.events (no garantizado)
+    // Mejor ver logs o abrir /status y revisar que QR fue generado.
+    return res.send('<html><body><h3>Esperando QR... revisa logs para ver el QR en terminal.</h3></body></html>');
+  });
+
+  // /status -> estado de conexión
+  app.get('/status', (req, res) => {
+    return res.json({ connected: !!sock.user, user: sock.user || null });
+  });
+
+  // /chats -> lista de chats (usa store)
+  app.get('/chats', (req, res) => {
+    try {
+      // store.chats es un Map-like en memoria
+      const chats = Array.from(store.chats.values()).map(c => ({
+        id: c.id,
+        name: c.contact?.vname || c.name || null,
+        isGroup: isGroupJid(c.id),
+        unreadCount: c.unreadCount || 0,
+        timestamp: c.conversationTimestamp || c.lastMessages?.[0]?.messageTimestamp || null
+      }));
+      res.json({ total: chats.length, chats });
+    } catch (e) {
+      console.error('/chats err', e);
+      res.status(500).send('Error listando chats');
+    }
+  });
+
+  // /test/:chatId/:message -> enviar mensaje de prueba
+  app.get('/test/:chatId/:message', async (req, res) => {
+    try {
+      const { chatId, message } = req.params;
+      if (!chatId || !message) return res.status(400).send('Faltan parámetros');
+      await sock.sendMessage(chatId, { text: `[TEST] ${message}` });
+      res.send(`Mensaje enviado a ${chatId}`);
+    } catch (e) {
+      console.error('/test err', e);
+      res.status(500).send(`Error: ${e.message || e}`);
+    }
+  });
+
+  // iniciar servidor express
+  app.listen(PORT, () => {
+    console.log(`🌐 Servidor en puerto ${PORT}`);
+  });
+
+  // Cron: mensaje automático por hora si GROUP_ID definido
+  cron.schedule('0 * * * *', async () => {
+    try {
+      if (!GROUP_ID) return;
+      await sock.sendMessage(GROUP_ID, { text: AUTO_MESSAGES[Math.floor(Math.random() * AUTO_MESSAGES.length)] });
+      console.log('Mensaje automático enviado a', GROUP_ID);
+    } catch (e) {
+      console.error('Cron error:', e.message || e);
+    }
+  });
+
+  // Guardado periódico de credenciales y subida
+  setInterval(async () => {
+    try { await saveState(); } catch (e) {}
+    try { await uploadAuthToSupabase(); } catch (e) {}
+  }, 60 * 1000); // cada 60s
+
+  console.log('Bot iniciado (Baileys). Revisa logs para QR si aún no autenticado.');
+}
+
+// arrancar
+startBot().catch(e => {
+  console.error('Error arrancando bot Baileys:', e);
+});
