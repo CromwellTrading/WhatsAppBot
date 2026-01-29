@@ -1,24 +1,22 @@
 {
-  "name": "whatsapp-moderator-bot",
-  "version": "1.0.1",
-  "description": "Bot guardián para grupos de WhatsApp con Supabase y Render",
-  "main": "mod-bot-web.js",
+  "name": "bot-guardian-baileys",
+  "version": "1.0.0",
+  "description": "Bot guardián WhatsApp ligero usando Baileys + Supabase",
+  "main": "mod-bot-baileys-full.js",
   "scripts": {
-    "start": "node mod-bot-web.js"
+    "start": "node mod-bot-baileys-full.js",
+    "dev": "NODE_ENV=development node --enable-source-maps mod-bot-baileys-full.js"
+  },
+  "author": "Asche",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.3",
-    "body-parser": "^1.20.2",
+    "@adiwajshing/baileys": "^4.0.0",
+    "@supabase/supabase-js": "^2.0.0",
     "express": "^4.18.2",
-    "fs-extra": "^11.2.0",
-    "node-cron": "^3.0.3",
-    "path": "^0.12.7",
-    "puppeteer-core": "^24.4.0",
-    "qrcode": "^1.5.3",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.20.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "node-cron": "^3.0.2",
+    "qrcode": "^1.5.1"
   }
 }
