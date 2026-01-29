@@ -1,11 +1,11 @@
-# Dockerfile - para Render (incluye chromium)
+# Usa bullseye para mejor compatibilidad con Chromium
 FROM node:20-bullseye
 
 ENV DEBIAN_FRONTEND=noninteractive
-# evitar que puppeteer descargue su chromium (usaremos el del sistema)
+# Evitar que puppeteer descargue su propio chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
-# instalar chromium y deps mínimos para puppeteer
+# Instalar chromium y dependencias del sistema
 RUN apt-get update && apt-get install -y \
     chromium \
     ca-certificates \
@@ -23,24 +23,24 @@ RUN apt-get update && apt-get install -y \
     libxdamage1 \
     libxrandr2 \
     xdg-utils \
-  && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
 
-# copiar package.json primero para cache
-COPY package.json package-lock.json* ./
+# Copiamos archivos de dependencias
+COPY package*.json ./
 
-# instalar dependencias (puppeteer no descargará chromium por la var de entorno)
-RUN npm install --production
+# Instalación limpia y sin dependencias de desarrollo
+RUN npm ci --omit=dev
 
-# copiar el resto del código
+# Copiar el resto del código
 COPY . .
 
-# Exponer puerto (ajusta si usas otro)
+# Exponer el puerto de Express
 EXPOSE 3000
 
-# Ruta del chromium del sistema (usada por mod-bot-web.js si está definida)
+# Definir la ruta de Chromium instalada en el sistema
 ENV CHROME_PATH=/usr/bin/chromium
 
-# Iniciar
+# Iniciar la aplicación
 CMD ["node", "mod-bot-web.js"]
