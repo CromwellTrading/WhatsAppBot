@@ -1,9 +1,8 @@
 // mod-bot-web.js
-// Versión fuerte: detecta TODO lo que hace el dispositivo vinculado + mensajes entrantes
-// Incluye: sync Supabase session, moderación (borrar enlaces, warnings, expulsar), y logs claros.
+// Bot guardián WhatsApp + Supabase session-sync (Captura TODOS los mensajes)
 const express = require('express');
 const cron = require('node-cron');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
@@ -125,17 +124,7 @@ process.on('uncaughtException', (err) => {
   console.error('uncaughtException:', err.stack || err);
 });
 
-// Helper de log claro (Render captura stdout)
-function logSimple(prefix, stuff) {
-  try {
-    const now = new Date().toISOString();
-    console.log(`${now} ${prefix} ${JSON.stringify(stuff)}`);
-  } catch (e) {
-    console.log('LOG ERR', prefix, stuff);
-  }
-}
-
-// Client events: qr/auth/ready
+// Client events
 client.on('qr', (qr) => {
   lastQr = qr;
   clientReady = false;
@@ -156,152 +145,232 @@ client.on('ready', async () => {
   clientReady = true;
   console.log('🚀 BOT LISTO Y CONECTADO');
 
+  // Listar todos los chats al iniciar
   try {
+    const chats = await client.getChats();
+    console.log(`📱 Total de chats: ${chats.length}`);
+    chats.forEach((chat, index) => {
+      console.log(`Chat ${index + 1}: ${chat.isGroup ? 'GRUPO' : 'PRIVADO'} - ${chat.name || 'Sin nombre'} - ID: ${chat.id._serialized}`);
+    });
+    
     await uploadAuthToSupabase();
   } catch (e) {
-    console.error('Error subiendo sesión tras ready:', e);
+    console.error('Error obteniendo chats:', e);
   }
 });
 
-// ------------------ EVENT LISTENERS PARA CAPTURAR TODO ------------------
-
-// 1) Mensajes entrantes (reliable for received messages)
-client.on('message', async (msg) => {
+// ============================================
+// FUNCIÓN PARA CAPTURAR TODOS LOS MENSAJES
+// ============================================
+function capturarMensajeCompleto(msg) {
   try {
-    const chat = await msg.getChat().catch(() => null);
-    const chatId = chat ? chat.id._serialized : (msg.from || '[unknown]');
-    const chatName = chat ? (chat.name || chatId) : chatId;
-    const author = msg.author || msg.from;
-    const fromMe = !!msg.fromMe;
-    const body = (msg.body || '').replace(/\n/g, ' ').substring(0, 800);
-
-    // Línea prioritaria para buscar en Render: IDGRP
-    console.log(`IDGRP ${chatId} | EVENT message | fromMe:${fromMe} | author:${author} | CHAT "${chatName}" | MSG "${body}"`);
-
-    // ----------------------------------------------------------------
-    // Conserva la misma lógica de moderación: solo actúa en grupos y si no es del bot
-    // Para no duplicar acciones, si el msg fue creado por el cliente (fromMe true) 
-    // evitamos volver a procesar la moderación que también se maneja en message_create.
-    if (!chat || !chat.isGroup || msg.fromMe) return;
-
-    // Detección enlaces y resto de la lógica (idéntica a la que ya tenías)
-    const hasLink = /https?:\/\/|www\.[^\s]+/i.test(msg.body || '');
-    if (!hasLink) return;
-
-    const senderId = msg.author || msg.from;
-    const delay = Math.floor(Math.random() * (30000 - 15000 + 1)) + 15000;
-
-    setTimeout(async () => {
-      try {
-        try {
-          await msg.delete(true);
-          console.log(`Mensaje borrado de ${senderId} en ${chatId}`);
-        } catch (err) {
-          console.warn('No se pudo borrar el mensaje (¿es el bot admin?). Error:', err.message || err);
-        }
-
-        const { data: userRow, error: selError } = await supabase
-          .from('warnings')
-          .select('warn_count')
-          .eq('user_id', senderId)
-          .single();
-
-        if (selError && selError.code !== 'PGRST116') {
-          console.error('Supabase select error (warnings):', selError);
-        }
-
-        let currentWarns = (userRow ? userRow.warn_count : 0) + 1;
-
-        if (!userRow) {
-          const { error: insErr } = await supabase.from('warnings').insert([{ user_id: senderId, warn_count: 1 }]);
-          if (insErr) console.error('Supabase insert error (warnings):', insErr);
-        } else {
-          const { error: upErr } = await supabase.from('warnings').update({ warn_count: currentWarns }).eq('user_id', senderId);
-          if (upErr) console.error('Supabase update error (warnings):', upErr);
-        }
-
-        let contact;
-        try { contact = await client.getContactById(senderId); } catch (e) { contact = null; }
-        const mentionText = contact ? `@${contact.number}` : `@${senderId.replace('@c.us', '')}`;
-
-        if (currentWarns < MAX_WARNINGS) {
-          try {
-            await chat.sendMessage(`⚠️ ${mentionText} ¡No enlaces! Advertencia ${currentWarns}/${MAX_WARNINGS}`, { mentions: contact ? [contact] : [] });
-            console.log(`Advertencia ${currentWarns} enviada a ${senderId}`);
-          } catch (e) {
-            console.warn('No se pudo enviar advertencia con mención:', e.message || e);
-            await chat.sendMessage(`⚠️ ${mentionText} ¡No enlaces! Advertencia ${currentWarns}/${MAX_WARNINGS}`);
-          }
-        } else {
-          try {
-            await chat.sendMessage(`🚫 ${mentionText} Baneado por spam.`, { mentions: contact ? [contact] : [] });
-            setTimeout(async () => {
-              try {
-                await chat.removeParticipants([senderId]);
-                console.log(`Usuario ${senderId} expulsado del chat ${chatId}`);
-              } catch (e) {
-                console.error('No se pudo expulsar al usuario (¿es el bot admin?).', e.message || e);
-              }
-            }, 2000);
-            const { error: delErr } = await supabase.from('warnings').delete().eq('user_id', senderId);
-            if (delErr) console.error('Error al borrar advertencias en Supabase:', delErr);
-          } catch (e) {
-            console.error('Error al manejar baneo:', e);
-          }
-        }
-      } catch (e) {
-        console.error('Error moderando (interno):', e);
+    // Datos básicos del mensaje
+    const timestamp = new Date().toISOString();
+    const from = msg.from || 'unknown';
+    const to = msg.to || 'unknown';
+    const isFromMe = msg.fromMe;
+    const isGroup = msg.id.remote ? msg.id.remote.includes('@g.us') : false;
+    
+    // Obtener el chat si es posible
+    let chatInfo = {};
+    try {
+      msg.getChat().then(chat => {
+        chatInfo = {
+          name: chat.name || 'Sin nombre',
+          id: chat.id._serialized,
+          isGroup: chat.isGroup,
+          isReadOnly: chat.isReadOnly
+        };
+      }).catch(() => {});
+    } catch (e) {}
+    
+    // Tipo de mensaje
+    let tipo = 'texto';
+    let contenido = '';
+    
+    if (msg.hasMedia) {
+      if (msg.type === 'image') {
+        tipo = 'imagen';
+        contenido = msg.body || '[IMAGEN]';
+      } else if (msg.type === 'video') {
+        tipo = 'video';
+        contenido = msg.body || '[VIDEO]';
+      } else if (msg.type === 'audio') {
+        tipo = 'audio';
+        contenido = msg.body || '[AUDIO]';
+      } else if (msg.type === 'document') {
+        tipo = 'documento';
+        contenido = msg.body || '[DOCUMENTO]';
+      } else if (msg.type === 'sticker') {
+        tipo = 'sticker';
+        contenido = msg.body || '[STICKER]';
       }
-    }, delay);
-
-  } catch (e) {
-    console.error('Error en handler message:', e);
+    } else if (msg.location) {
+      tipo = 'ubicación';
+      contenido = `Lat: ${msg.location.latitude}, Lon: ${msg.location.longitude}`;
+    } else if (msg.body) {
+      contenido = msg.body;
+    } else {
+      contenido = '[SIN CONTENIDO]';
+    }
+    
+    // Limitar contenido para logs
+    const contenidoLog = contenido.length > 200 ? contenido.substring(0, 200) + '...' : contenido;
+    
+    // Log completo
+    console.log(`\n📨 ====== MENSAJE CAPTURADO ======`);
+    console.log(`🕐 ${timestamp}`);
+    console.log(`📱 DE: ${from} ${isFromMe ? '(YO)' : ''}`);
+    console.log(`📨 PARA: ${to}`);
+    console.log(`🏷 TIPO: ${tipo.toUpperCase()}`);
+    console.log(`💬 CONTENIDO: ${contenidoLog}`);
+    console.log(`👥 ES GRUPO: ${isGroup}`);
+    if (chatInfo.name) {
+      console.log(`🗂 CHAT: ${chatInfo.name} (${chatInfo.id})`);
+    }
+    console.log(`🔑 ID MENSAJE: ${msg.id._serialized}`);
+    console.log(`📎 TIENE MEDIA: ${msg.hasMedia}`);
+    console.log(`==================================\n`);
+    
+    // ======= LÍNEA ESPECIAL PARA ID DE GRUPO =======
+    if (isGroup && chatInfo.id) {
+      console.log(`🚨🚨🚨 IDGRP ${chatInfo.id} 🚨🚨🚨`);
+    }
+    
+    // Guardar en archivo log (opcional)
+    const logEntry = `${timestamp} | FROM:${from} | TO:${to} | TYPE:${tipo} | CONTENT:${contenido.replace(/\n/g, ' ').substring(0, 100)} | GROUP:${isGroup} | CHAT_ID:${chatInfo.id || 'N/A'}\n`;
+    fs.appendFileSync('whatsapp_logs.txt', logEntry, 'utf8');
+    
+  } catch (error) {
+    console.error('Error capturando mensaje:', error);
   }
+}
+
+// ============================================
+// ESCUCHAR TODOS LOS EVENTOS DE MENSAJES
+// ============================================
+
+// 1. Mensajes nuevos recibidos
+client.on('message', async (msg) => {
+  capturarMensajeCompleto(msg);
 });
 
-// 2) Mensajes creados por el cliente (este captura cosas que el cliente genera localmente)
+// 2. Mensajes creados (incluye los que envías tú)
 client.on('message_create', async (msg) => {
+  // Primero capturar el mensaje
+  capturarMensajeCompleto(msg);
+  
+  // Luego aplicar moderación (solo si no es tuyo y es grupo)
   try {
-    const chat = await msg.getChat().catch(() => null);
-    const chatId = chat ? chat.id._serialized : (msg.from || '[unknown]');
-    const chatName = chat ? (chat.name || chatId) : chatId;
-    const author = msg.author || msg.from;
-    const fromMe = !!msg.fromMe;
-    const body = (msg.body || '').replace(/\n/g, ' ').substring(0, 800);
+    if (!msg.fromMe) {
+      const chat = await msg.getChat();
+      if (chat && chat.isGroup) {
+        
+        // === AQUÍ TU CÓDIGO DE MODERACIÓN ORIGINAL ===
+        const hasLink = /https?:\/\/|www\.[^\s]+/i.test(msg.body || '');
+        if (!hasLink) return;
 
-    // Línea clara para buscar: CREATED
-    console.log(`CREATED ${chatId} | fromMe:${fromMe} | author:${author} | CHAT "${chatName}" | MSG "${body}"`);
+        const senderId = msg.author || msg.from;
+        const delay = Math.floor(Math.random() * (30000 - 15000 + 1)) + 15000;
 
-    // No volvemos a ejecutar la moderación aquí (para evitar duplicados) - la moderación se maneja en 'message' cuando corresponde.
+        setTimeout(async () => {
+          try {
+            try {
+              await msg.delete(true);
+              console.log(`Mensaje borrado de ${senderId}`);
+            } catch (err) {
+              console.warn('No se pudo borrar el mensaje:', err.message || err);
+            }
+
+            // Gestionar warnings en Supabase
+            const { data: userRow, error: selError } = await supabase
+              .from('warnings')
+              .select('warn_count')
+              .eq('user_id', senderId)
+              .single();
+
+            if (selError && selError.code !== 'PGRST116') {
+              console.error('Supabase select error (warnings):', selError);
+            }
+
+            let currentWarns = (userRow ? userRow.warn_count : 0) + 1;
+
+            if (!userRow) {
+              const { error: insErr } = await supabase.from('warnings').insert([{ user_id: senderId, warn_count: 1 }]);
+              if (insErr) console.error('Supabase insert error (warnings):', insErr);
+            } else {
+              const { error: upErr } = await supabase.from('warnings').update({ warn_count: currentWarns }).eq('user_id', senderId);
+              if (upErr) console.error('Supabase update error (warnings):', upErr);
+            }
+
+            let contact;
+            try { contact = await client.getContactById(senderId); } catch (e) { contact = null; }
+            const mentionText = contact ? `@${contact.number}` : `@${senderId.replace('@c.us', '')}`;
+
+            if (currentWarns < MAX_WARNINGS) {
+              try {
+                await chat.sendMessage(`⚠️ ${mentionText} ¡No enlaces! Advertencia ${currentWarns}/${MAX_WARNINGS}`, { mentions: contact ? [contact] : [] });
+                console.log(`Advertencia ${currentWarns} enviada a ${senderId}`);
+              } catch (e) {
+                console.warn('No se pudo enviar advertencia con mención:', e.message || e);
+                await chat.sendMessage(`⚠️ ${mentionText} ¡No enlaces! Advertencia ${currentWarns}/${MAX_WARNINGS}`);
+              }
+            } else {
+              try {
+                await chat.sendMessage(`🚫 ${mentionText} Baneado por spam.`, { mentions: contact ? [contact] : [] });
+                setTimeout(async () => {
+                  try {
+                    await chat.removeParticipants([senderId]);
+                    console.log(`Usuario ${senderId} expulsado`);
+                  } catch (e) {
+                    console.error('No se pudo expulsar al usuario:', e.message || e);
+                  }
+                }, 2000);
+                const { error: delErr } = await supabase.from('warnings').delete().eq('user_id', senderId);
+                if (delErr) console.error('Error al borrar advertencias:', delErr);
+              } catch (e) {
+                console.error('Error al manejar baneo:', e);
+              }
+            }
+          } catch (e) {
+            console.error('Error moderando:', e);
+          }
+        }, delay);
+      }
+    }
   } catch (e) {
-    console.error('Error en handler message_create:', e);
+    console.error('Error en moderación:', e);
   }
 });
 
-// 3) ACKs de mensajes (útil para ver que el dispositivo envió/recibió ack)
-client.on('message_ack', (msg, ack) => {
-  try {
-    // ack codes: 0 - ACK_TYPE_PENDING? ; 1 - SENT, 2 - DELIVERED, 3 - READ (puede variar)
-    const chatId = msg?.from || '[unknown]';
-    console.log(`ACK ${chatId} | msgId:${msg?.id?._serialized} | fromMe:${!!msg?.fromMe} | ack:${ack}`);
-  } catch (e) {
-    console.error('Error en message_ack:', e);
-  }
-});
-
-// 4) Revoke events (mensaje eliminado por usuario)
+// 3. Mensajes eliminados
 client.on('message_revoke_everyone', async (after, before) => {
-  try {
-    // after = message AFTER revoke (maybe null), before = message BEFORE revoke (the deleted msg)
-    const beforeBody = before && before.body ? before.body.replace(/\n/g, ' ').substring(0, 400) : '[no-body]';
-    const chatId = (before && before.from) || (after && after.from) || '[unknown]';
-    console.log(`REVOKE ${chatId} | deleted-msg-snippet: "${beforeBody}"`);
-  } catch (e) {
-    console.error('Error en message_revoke_everyone:', e);
+  console.log(`🗑 MENSAJE ELIMINADO:`);
+  if (before) {
+    console.log(`   Contenido original: ${before.body || '[SIN TEXTO]'}`);
+    console.log(`   De: ${before.author || before.from}`);
+  }
+  if (after) {
+    console.log(`   Reemplazado por: ${after.body || '[SIN TEXTO]'}`);
   }
 });
 
-// ------------------ AUTO POST (mantengo) ------------------
+// 4. Mensajes editados
+client.on('message_edit', async (msg, newBody, oldBody) => {
+  console.log(`✏️ MENSAJE EDITADO:`);
+  console.log(`   De: ${msg.from || msg.author}`);
+  console.log(`   Antes: ${oldBody}`);
+  console.log(`   Después: ${newBody}`);
+});
+
+// 5. Reacciones a mensajes
+client.on('message_reaction', async (reaction) => {
+  console.log(`👍 REACCIÓN: ${reaction.emoji || '[sin emoji]'}`);
+  console.log(`   Al mensaje de: ${reaction.msgId ? reaction.msgId.remote : 'desconocido'}`);
+  console.log(`   Por: ${reaction.senderId}`);
+});
+
+// Auto post horario
 cron.schedule('0 * * * *', async () => {
   if (clientReady && GROUP_ID) {
     try {
@@ -317,7 +386,48 @@ cron.schedule('0 * * * *', async () => {
   }
 });
 
-// RUTAS web: /qr y /
+// Función para forzar la obtención de chats
+app.get('/chats', async (req, res) => {
+  try {
+    if (!clientReady) {
+      return res.status(400).send('Cliente no listo');
+    }
+    
+    const chats = await client.getChats();
+    const chatList = chats.map(chat => ({
+      id: chat.id._serialized,
+      name: chat.name || 'Sin nombre',
+      isGroup: chat.isGroup,
+      isReadOnly: chat.isReadOnly,
+      timestamp: chat.timestamp,
+      unreadCount: chat.unreadCount
+    }));
+    
+    res.json({
+      total: chats.length,
+      chats: chatList
+    });
+  } catch (error) {
+    res.status(500).send(`Error: ${error.message}`);
+  }
+});
+
+// Ruta para enviar un mensaje de prueba
+app.get('/test/:chatId/:message', async (req, res) => {
+  try {
+    if (!clientReady) {
+      return res.status(400).send('Cliente no listo');
+    }
+    
+    const { chatId, message } = req.params;
+    await client.sendMessage(chatId, `[TEST] ${message}`);
+    res.send(`Mensaje enviado a ${chatId}`);
+  } catch (error) {
+    res.status(500).send(`Error: ${error.message}`);
+  }
+});
+
+// Rutas web: /qr y /
 app.get('/qr', async (req, res) => {
   if (lastQr) {
     res.setHeader('Content-Type', 'image/png');
@@ -332,13 +442,39 @@ app.get('/qr', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('Bot Guardián Online'));
+app.get('/', (req, res) => res.send(`
+  <html>
+    <head>
+      <title>Bot Guardián Online</title>
+      <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        h1 { color: #333; }
+        .endpoints { background: #f5f5f5; padding: 20px; border-radius: 5px; }
+        code { background: #e0e0e0; padding: 2px 5px; }
+      </style>
+    </head>
+    <body>
+      <h1>🤖 Bot Guardián WhatsApp</h1>
+      <p>Estado: ${clientReady ? '✅ CONECTADO' : '⏳ CONECTANDO...'}</p>
+      <p><a href="/qr">Ver QR Code</a></p>
+      <p><a href="/chats">Ver todos los chats</a></p>
+      <div class="endpoints">
+        <h3>Endpoints:</h3>
+        <ul>
+          <li><code>/qr</code> - Ver código QR</li>
+          <li><code>/chats</code> - Listar todos los chats</li>
+          <li><code>/test/[chatId]/[mensaje]</code> - Enviar mensaje de prueba</li>
+        </ul>
+      </div>
+    </body>
+  </html>
+`));
 
-// Iniciar: restaurar sesión y arrancar cliente
 (async () => {
   await downloadAuthFromSupabase();
   client.initialize();
   app.listen(PORT, () => {
     console.log(`Puerto ${PORT} - Servidor iniciado`);
+    console.log(`Accede a http://localhost:${PORT} para ver el estado`);
   });
 })();
