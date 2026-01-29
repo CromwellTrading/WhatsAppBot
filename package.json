@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp-moderator-web",
+  "version": "1.0.0",
+  "main": "mod-bot-web.js",
+  "scripts": {
+    "start": "node mod-bot-web.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "whatsapp-web.js": "^1.20.0",
+    "qrcode-terminal": "^0.12.0",
+    "node-cron": "^3.0.2",
+    "fs-extra": "^11.1.1",
+    "pg": "^8.10.0"
+  }
+}
