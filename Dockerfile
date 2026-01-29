@@ -30,8 +30,9 @@ WORKDIR /usr/src/app
 # Copiamos archivos de dependencias
 COPY package*.json ./
 
-# Instalación limpia y sin dependencias de desarrollo
-RUN npm ci --omit=dev
+# Instalación normal (npm la genera automáticamente en el contenedor)
+RUN npm install --omit=dev --no-audit --no-fund
+
 
 # Copiar el resto del código
 COPY . .
