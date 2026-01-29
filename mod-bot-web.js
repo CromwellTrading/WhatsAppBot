@@ -7,6 +7,7 @@ const cron = require('node-cron');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { Pool } = require('pg');
+const puppeteer = require('puppeteer');
 
 const POSTS_FILE = path.join(__dirname, 'posts.json');
 const WARN_FILE  = path.join(__dirname, 'warnings.json');
@@ -20,20 +21,22 @@ let pool = null;
 if (USE_DB) {
   pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
   (async ()=>{
-    await pool.query(`CREATE TABLE IF NOT EXISTS posts (
-      id SERIAL PRIMARY KEY,
-      message TEXT NOT NULL,
-      cron_spec TEXT,
-      active BOOLEAN DEFAULT true,
-      created_at TIMESTAMP DEFAULT now()
-    );`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS warnings (
-      id SERIAL PRIMARY KEY,
-      user_id TEXT UNIQUE,
-      warns INTEGER DEFAULT 0,
-      updated_at TIMESTAMP DEFAULT now()
-    );`);
-  })().catch(e=>console.error('DB init error', e));
+    try {
+      await pool.query(`CREATE TABLE IF NOT EXISTS posts (
+        id SERIAL PRIMARY KEY,
+        message TEXT NOT NULL,
+        cron_spec TEXT,
+        active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT now()
+      );`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS warnings (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT UNIQUE,
+        warns INTEGER DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT now()
+      );`);
+    } catch(e){ console.error('DB init error', e); }
+  })();
 }
 
 async function loadPosts() {
@@ -63,7 +66,12 @@ const GROUP_ID = process.env.GROUP_ID || '';
 
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: "moderator-bot" }),
-  puppeteer: { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox'] }
+  puppeteer: {
+    headless: true,
+    // prefer CHROME_PATH ( Docker ), fallback a puppeteer.executablePath() si existe localmente
+    executablePath: process.env.CHROME_PATH || (puppeteer && puppeteer.executablePath ? puppeteer.executablePath() : undefined),
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+  }
 });
 
 client.on('qr', qr => {
