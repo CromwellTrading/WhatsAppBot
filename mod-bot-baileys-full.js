@@ -1,6 +1,6 @@
 // mod-bot-baileys-full.js
 // Bot Guardián Baileys - versión robusta para hosts efímeros (Render free)
-// Persiste sesión en Supabase; minimiza RAM manteniendo solo datos recientes.
+// Usa useMultiFileAuthState + persistencia multi-file en Supabase.
 
 const express = require('express');
 const cron = require('node-cron');
@@ -12,7 +12,7 @@ const { createClient } = require('@supabase/supabase-js');
 const {
   default: makeWASocket,
   DisconnectReason,
-  useSingleFileAuthState,
+  useMultiFileAuthState,
   fetchLatestBaileysVersion
 } = require('@adiwajshing/baileys');
 
@@ -21,7 +21,6 @@ const PORT = process.env.PORT || 3000;
 
 // -------- CONFIG --------
 const AUTH_DIR = path.join(__dirname, 'baileys_auth'); // carpeta local temporal
-const AUTH_FILE = path.join(AUTH_DIR, 'auth_info_multi.json');
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -40,13 +39,9 @@ const AUTO_MESSAGES = [
   "Mensaje automático: eviten enlaces."
 ];
 
-// -------- AUTH (archivo) --------
-const { state, saveState } = useSingleFileAuthState(AUTH_FILE);
-
-// -------- RECENT CHATS (pequeño, para /chats) --------
+// -------- SMALL RECENT CHATS MAP --------
 const RECENT_CHAT_LIMIT = 200;
 const recentChats = new Map(); // key: jid, value: { id, lastSeenISO, isGroup, sampleText }
-
 function pushRecentChat(jid, isGroup, sampleText) {
   recentChats.set(jid, { id: jid, isGroup: !!isGroup, lastSeenISO: new Date().toISOString(), sampleText: String(sampleText).slice(0, 200) });
   if (recentChats.size > RECENT_CHAT_LIMIT) {
@@ -59,7 +54,6 @@ function pushRecentChat(jid, isGroup, sampleText) {
 function isGroupJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@g.us');
 }
-
 function safeTextFromMessage(msg) {
   if (!msg) return '';
   if (msg.message?.conversation) return msg.message.conversation;
@@ -70,21 +64,37 @@ function safeTextFromMessage(msg) {
   return '[NO-TEXTO]';
 }
 
-// -------- SUPABASE SESSION PERSISTENCE --------
+// -------- SUPABASE: session multi-file persistence --------
+// We'll store ALL files in AUTH_DIR as a JSON object in wa_session_json.auth_json
+// Row shape: { key: 'baileys_auth', auth_json: '{"filename": "base64", ...}' }
+
 async function uploadAuthToSupabase() {
   try {
-    if (!fs.existsSync(AUTH_FILE)) {
-      console.warn('⚠️ No hay auth file local para subir');
+    // build object of files
+    const obj = {};
+    if (!fs.existsSync(AUTH_DIR)) {
+      console.warn('⚠️ AUTH_DIR vacío al subir (ningún archivo aún).');
       return false;
     }
-    const b64 = fs.readFileSync(AUTH_FILE).toString('base64');
-    const payload = [{ key: 'baileys_auth', auth_b64: b64 }];
+    const walk = (dir) => {
+      const items = fs.readdirSync(dir, { withFileTypes: true });
+      for (const it of items) {
+        const full = path.join(dir, it.name);
+        if (it.isDirectory()) walk(full);
+        else {
+          const rel = path.relative(AUTH_DIR, full).replace(/\\/g, '/');
+          obj[rel] = fs.readFileSync(full).toString('base64');
+        }
+      }
+    };
+    walk(AUTH_DIR);
+    const payload = [{ key: 'baileys_auth', auth_json: JSON.stringify(obj) }];
     const { error } = await supabase.from('wa_session_json').upsert(payload, { onConflict: ['key'] });
     if (error) {
       console.error('❌ Error subiendo auth a Supabase:', error);
       return false;
     }
-    console.log('✅ Auth subido a Supabase');
+    console.log('✅ Auth (multi-file) subido a Supabase');
     return true;
   } catch (e) {
     console.error('uploadAuthToSupabase err:', e);
@@ -94,18 +104,23 @@ async function uploadAuthToSupabase() {
 
 async function downloadAuthFromSupabase() {
   try {
-    const { data, error } = await supabase.from('wa_session_json').select('auth_b64').eq('key', 'baileys_auth').single();
+    const { data, error } = await supabase.from('wa_session_json').select('auth_json').eq('key', 'baileys_auth').single();
     if (error) {
       console.warn('⚠️ No auth en Supabase o error al leer:', error.message || error);
       return false;
     }
-    if (!data || !data.auth_b64) {
-      console.warn('⚠️ Fila de auth vacía en Supabase');
+    if (!data || !data.auth_json) {
+      console.warn('⚠️ Fila auth vacía');
       return false;
     }
-    fs.mkdirSync(path.dirname(AUTH_FILE), { recursive: true });
-    fs.writeFileSync(AUTH_FILE, Buffer.from(data.auth_b64, 'base64'));
-    console.log('⬇️ Auth restaurado desde Supabase');
+    const obj = JSON.parse(data.auth_json);
+    // write files
+    for (const [rel, b64] of Object.entries(obj)) {
+      const full = path.join(AUTH_DIR, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, Buffer.from(b64, 'base64'));
+    }
+    console.log('⬇️ Auth restaurado desde Supabase (archivos escritos en AUTH_DIR)');
     return true;
   } catch (e) {
     console.error('downloadAuthFromSupabase err:', e);
@@ -127,28 +142,22 @@ async function getWarnCount(user_id) {
     return 0;
   }
 }
-
 async function setWarnCount(user_id, count) {
   try {
     const { error } = await supabase.from('warnings').upsert([{ user_id, warn_count: count }], { onConflict: ['user_id'] });
     if (error) console.error('Error setWarnCount:', error);
-  } catch (e) {
-    console.error('setWarnCount err:', e);
-  }
+  } catch (e) { console.error('setWarnCount err:', e); }
 }
-
 async function deleteWarns(user_id) {
   try {
     const { error } = await supabase.from('warnings').delete().eq('user_id', user_id);
     if (error) console.error('Error deleteWarns:', error);
-  } catch (e) {
-    console.error('deleteWarns err:', e);
-  }
+  } catch (e) { console.error('deleteWarns err:', e); }
 }
 
 // -------- START BOT --------
 async function startBot() {
-  // Intentos para restaurar sesión desde Supabase (hosts efímeros)
+  // 1) Try restore from Supabase (multiple attempts)
   let restored = false;
   for (let i = 0; i < 6; i++) {
     try {
@@ -158,6 +167,9 @@ async function startBot() {
     console.log(`Intento restore ${i + 1}/6 fallido, reintentando en 1s...`);
     await new Promise(r => setTimeout(r, 1000));
   }
+
+  // 2) useMultiFileAuthState -> returns { state, saveCreds }
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
   const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 2204, 13] }));
   console.log('Baileys version:', version);
@@ -173,11 +185,11 @@ async function startBot() {
   let uploadedOnce = false;
   let uploading = false;
 
+  // Debounced uploader (reads folder and uploads)
   async function saveAndUploadDebounced() {
     if (uploading) return;
     uploading = true;
     try {
-      await saveState();
       const ok = await uploadAuthToSupabase();
       if (ok) uploadedOnce = true;
     } catch (e) {
@@ -187,6 +199,17 @@ async function startBot() {
     }
   }
 
+  // When creds update: saveCreds AND upload
+  sock.ev.on('creds.update', async (creds) => {
+    try {
+      await saveCreds(creds); // writes files under AUTH_DIR
+      await saveAndUploadDebounced();
+    } catch (e) {
+      console.warn('creds.update handler err:', e);
+    }
+  });
+
+  // connection updates
   sock.ev.on('connection.update', async (update) => {
     try {
       const { connection, lastDisconnect, qr } = update;
@@ -195,15 +218,21 @@ async function startBot() {
         console.log('⚠️ Nuevo QR generado. /qr para escanear.');
       }
       if (connection === 'open') {
-        console.log('🚀 Conectado (OPEN). Guardando cred y subiendo...');
+        console.log('🚀 Conectado (OPEN). Subiendo credenciales a Supabase...');
         await saveAndUploadDebounced();
       }
       if (connection === 'close') {
-        console.warn('🔌 Conexion cerrada:', lastDisconnect?.error || lastDisconnect);
+        console.warn('🔌 Conexión cerrada:', lastDisconnect?.error || lastDisconnect);
         const code = lastDisconnect?.error?.output?.statusCode;
         if (code === DisconnectReason.loggedOut) {
-          console.warn('Sesión deslogueada. Borrando auth local...');
-          try { fs.unlinkSync(AUTH_FILE); } catch (e) {}
+          console.warn('Sesión deslogueada. Borrando auth local y en Supabase...');
+          // borrar local files
+          try {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+            fs.mkdirSync(AUTH_DIR, { recursive: true });
+          } catch (e) {}
+          // borrar en supabase
+          try { await supabase.from('wa_session_json').delete().eq('key', 'baileys_auth'); } catch (e) { console.warn('No se pudo borrar en Supabase:', e); }
         }
       }
     } catch (e) {
@@ -211,10 +240,7 @@ async function startBot() {
     }
   });
 
-  sock.ev.on('creds.update', async () => {
-    try { await saveAndUploadDebounced(); } catch (e) { console.warn('creds.update err', e); }
-  });
-
+  // messages
   sock.ev.on('messages.upsert', async (m) => {
     try {
       if (!m.messages || m.type === 'notify') return;
@@ -259,9 +285,12 @@ async function startBot() {
     }
   });
 
+  // endpoints
   app.get('/qr', async (req, res) => {
-    if (fs.existsSync(AUTH_FILE)) {
-      return res.send(`<html><body><h3>Autenticado.</h3><p>Si necesitas forzar nuevo QR, elimina auth_info_multi.json y/o la fila en Supabase y reinicia el servicio.</p></body></html>`);
+    // if any files exist, assume authenticated
+    const files = fs.existsSync(AUTH_DIR) ? fs.readdirSync(AUTH_DIR) : [];
+    if (files.length > 0) {
+      return res.send(`<html><body><h3>Autenticado (archivos en AUTH_DIR).</h3><p>Si necesitas forzar nuevo QR, elimina archivos de /baileys_auth y la fila en Supabase y reinicia.</p></body></html>`);
     }
     if (!lastQr) return res.send('<html><body>Esperando QR... revisa logs.</body></html>');
     try {
@@ -307,7 +336,9 @@ async function startBot() {
 
   app.get('/logout', async (req, res) => {
     try {
-      try { fs.unlinkSync(AUTH_FILE); } catch (e) {}
+      // borrar local
+      try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }); } catch (e) {}
+      // borrar en Supabase
       const { error } = await supabase.from('wa_session_json').delete().eq('key', 'baileys_auth');
       if (error) console.error('Error borrando auth en Supabase:', error);
       res.send('Logout forzado: auth local y Supabase eliminados.');
@@ -316,8 +347,10 @@ async function startBot() {
     }
   });
 
+  // start express
   app.listen(PORT, () => console.log(`🌐 Servidor en puerto ${PORT}`));
 
+  // Cron: mensajes automáticos si GROUP_ID definido
   cron.schedule('0 * * * *', async () => {
     try {
       if (!GROUP_ID) return;
@@ -328,6 +361,7 @@ async function startBot() {
     }
   });
 
+  // periodic upload: try every 15s early then continues
   setInterval(async () => {
     try { await saveAndUploadDebounced(); } catch (e) {}
   }, 15 * 1000);
