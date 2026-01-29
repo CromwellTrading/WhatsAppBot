@@ -49,7 +49,6 @@ const recentChats = new Map(); // key: jid, value: { id, lastSeenISO, isGroup, s
 
 function pushRecentChat(jid, isGroup, sampleText) {
   recentChats.set(jid, { id: jid, isGroup: !!isGroup, lastSeenISO: new Date().toISOString(), sampleText: String(sampleText).slice(0, 200) });
-  // mantener tamaño
   if (recentChats.size > RECENT_CHAT_LIMIT) {
     const firstKey = recentChats.keys().next().value;
     recentChats.delete(firstKey);
@@ -115,7 +114,6 @@ async function downloadAuthFromSupabase() {
 }
 
 // -------- SUPABASE: warnings helpers --------
-// Tabla: warnings (user_id TEXT PK, warn_count INTEGER)
 async function getWarnCount(user_id) {
   try {
     const { data, error } = await supabase.from('warnings').select('warn_count').eq('user_id', user_id).single();
@@ -168,14 +166,13 @@ async function startBot() {
     version,
     auth: state,
     printQRInTerminal: false,
-    logger: { level: 'warn' } // bajar ruido para ahorrar logs
+    logger: { level: 'warn' }
   });
 
   let lastQr = null;
   let uploadedOnce = false;
   let uploading = false;
 
-  // Debounced save + upload
   async function saveAndUploadDebounced() {
     if (uploading) return;
     uploading = true;
@@ -190,7 +187,6 @@ async function startBot() {
     }
   }
 
-  // connection updates
   sock.ev.on('connection.update', async (update) => {
     try {
       const { connection, lastDisconnect, qr } = update;
@@ -208,8 +204,6 @@ async function startBot() {
         if (code === DisconnectReason.loggedOut) {
           console.warn('Sesión deslogueada. Borrando auth local...');
           try { fs.unlinkSync(AUTH_FILE); } catch (e) {}
-          // si querés limpiar Supabase también, descomenta:
-          // await supabase.from('wa_session_json').delete().eq('key','baileys_auth');
         }
       }
     } catch (e) {
@@ -221,7 +215,6 @@ async function startBot() {
     try { await saveAndUploadDebounced(); } catch (e) { console.warn('creds.update err', e); }
   });
 
-  // messages
   sock.ev.on('messages.upsert', async (m) => {
     try {
       if (!m.messages || m.type === 'notify') return;
@@ -235,18 +228,13 @@ async function startBot() {
       const fromMe = !!msg.key.fromMe;
       const body = safeTextFromMessage(msg);
 
-      // push a recent chat small record
       pushRecentChat(remoteJid, isGroup, body);
-
-      // log simple
       console.log(`MSG ${isGroup ? 'GRUPO' : 'PRIVADO'} ${remoteJid} ${participant} ${String(body).slice(0,80)}`);
 
-      // moderation
       if (isGroup && !fromMe) {
         const hasLink = /https?:\/\/|www\.[^\s]+/i.test(String(body));
         if (!hasLink) return;
 
-        // intentar borrar (no siempre posible)
         try { await sock.sendMessage(remoteJid, { delete: msg.key }); } catch (e) { /* ignore */ }
 
         const senderId = participant;
@@ -271,7 +259,6 @@ async function startBot() {
     }
   });
 
-  // endpoints
   app.get('/qr', async (req, res) => {
     if (fs.existsSync(AUTH_FILE)) {
       return res.send(`<html><body><h3>Autenticado.</h3><p>Si necesitas forzar nuevo QR, elimina auth_info_multi.json y/o la fila en Supabase y reinicia el servicio.</p></body></html>`);
@@ -320,9 +307,7 @@ async function startBot() {
 
   app.get('/logout', async (req, res) => {
     try {
-      // borrar local
       try { fs.unlinkSync(AUTH_FILE); } catch (e) {}
-      // borrar en Supabase
       const { error } = await supabase.from('wa_session_json').delete().eq('key', 'baileys_auth');
       if (error) console.error('Error borrando auth en Supabase:', error);
       res.send('Logout forzado: auth local y Supabase eliminados.');
@@ -331,10 +316,8 @@ async function startBot() {
     }
   });
 
-  // start express
   app.listen(PORT, () => console.log(`🌐 Servidor en puerto ${PORT}`));
 
-  // Cron: mensajes automáticos si GROUP_ID definido
   cron.schedule('0 * * * *', async () => {
     try {
       if (!GROUP_ID) return;
@@ -345,17 +328,13 @@ async function startBot() {
     }
   });
 
-  // subida periódica: cada 15s al inicio, luego cada 60s
   setInterval(async () => {
-    try {
-      await saveAndUploadDebounced();
-    } catch (e) {}
+    try { await saveAndUploadDebounced(); } catch (e) {}
   }, 15 * 1000);
 
   console.log('Bot iniciado (Baileys). Revisa logs para QR si aún no autenticado.');
 }
 
-// arrancar
 startBot().catch(e => {
   console.error('Error arrancando bot Baileys:', e);
 });
