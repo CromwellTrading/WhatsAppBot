@@ -4,22 +4,26 @@ const fs = require('fs-extra');
 const path = require('path');
 const cron = require('node-cron');
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const qrcodeTerminal = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const { Pool } = require('pg');
 const puppeteer = require('puppeteer');
 
+const app = express();
 const POSTS_FILE = path.join(__dirname, 'posts.json');
 const WARN_FILE  = path.join(__dirname, 'warnings.json');
 
-// Asegurar existencia de archivos JSON
+let lastQr = null;
+
+// --- INICIALIZACIÓN DE ARCHIVOS ---
 fs.ensureFileSync(POSTS_FILE);
 fs.ensureFileSync(WARN_FILE);
 if (!fs.readJsonSync(POSTS_FILE, { throws:false })) fs.writeJsonSync(POSTS_FILE, []);
 if (!fs.readJsonSync(WARN_FILE,  { throws:false })) fs.writeJsonSync(WARN_FILE, {});
 
+// --- CONFIGURACIÓN DE BASE DE DATOS (POSTGRESQL) ---
 const USE_DB = !!process.env.DATABASE_URL;
 let pool = null;
-
 if (USE_DB) {
   pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
   (async ()=>{
@@ -30,11 +34,12 @@ if (USE_DB) {
       await pool.query(`CREATE TABLE IF NOT EXISTS warnings (
         id SERIAL PRIMARY KEY, user_id TEXT UNIQUE, warns INTEGER DEFAULT 0, updated_at TIMESTAMP DEFAULT now()
       );`);
-    } catch(e){ console.error('Error inicializando DB:', e); }
+      console.log('✅ Base de datos PostgreSQL conectada y tablas listas');
+    } catch(e){ console.error('❌ Error DB init:', e); }
   })();
 }
 
-// Funciones de carga/guardado
+// --- FUNCIONES DE PERSISTENCIA ---
 async function loadPosts() {
   if (USE_DB) {
     const res = await pool.query('SELECT id, message, cron_spec, active FROM posts ORDER BY id DESC;');
@@ -56,49 +61,50 @@ async function savePost(post) {
   return post;
 }
 
+// --- CONFIGURACIÓN DEL CLIENTE WHATSAPP ---
 const MAX_WARNINGS = parseInt(process.env.MAX_WARNINGS||'3');
 const GROUP_ID = process.env.GROUP_ID || '';
 
-// Inicialización del Cliente con Puppeteer optimizado para Docker
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: "moderator-bot" }),
   puppeteer: {
     headless: true,
     executablePath: process.env.CHROME_PATH || '/usr/bin/chromium',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu'
-    ]
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
   }
 });
 
-client.on('qr', qr => {
-  qrcode.generate(qr, { small: true });
-  console.log('[QR] Escanea el código para vincular el bot');
+client.on('qr', (qr) => {
+  lastQr = qr;
+  qrcodeTerminal.generate(qr, { small: true });
+  console.log('[QR] Nuevo código generado. Míralo en: /qr');
 });
 
-client.on('ready', () => console.log('✅ Cliente de WhatsApp listo'));
+client.on('ready', () => {
+  lastQr = null;
+  console.log('✅ Bot de WhatsApp activo y guardián funcionando');
+});
 
+// --- LÓGICA DE MODERACIÓN (GUARDÍAN) ---
 function isLink(text) {
-  if (!text) return false;
   return /https?:\/\/|www\.[^\s]+/i.test(text);
 }
 
-// Lógica de Moderación
 client.on('message_create', async msg => {
   try {
+    // Solo actuar en grupos y si no es un mensaje propio
     if (!msg.from.endsWith('@g.us') || msg.fromMe) return;
 
-    const senderId = msg.author || msg.from;
     const body = msg.body || (msg.hasMedia && msg.caption) || '';
     if (!isLink(body)) return;
 
-    // Intentar borrar mensaje
-    try { await msg.delete(true); } catch(e) { console.warn('No se pudo borrar:', e.message); }
+    const senderId = msg.author || msg.from;
+    const chat = await msg.getChat();
 
-    // Manejo de advertencias
+    // 1. Borrar el mensaje inmediatamente
+    try { await msg.delete(true); } catch(e) { console.warn('No pude borrar el mensaje. ¿Soy admin?'); }
+
+    // 2. Gestionar advertencias
     let warnCount = 0;
     if (USE_DB) {
       await pool.query('INSERT INTO warnings(user_id, warns) VALUES($1,1) ON CONFLICT (user_id) DO UPDATE SET warns = warnings.warns + 1, updated_at = now()', [senderId]);
@@ -106,58 +112,73 @@ client.on('message_create', async msg => {
       warnCount = res.rows[0].warns;
     } else {
       const warnings = await fs.readJson(WARN_FILE);
-      const key = senderId.replace(/@c\.us|@s\.whatsapp\.net/g,'');
+      const key = senderId.replace(/[^0-9]/g, '');
       warnings[key] = (warnings[key]||0) + 1;
       await fs.writeJson(WARN_FILE, warnings, { spaces:2 });
       warnCount = warnings[key];
     }
 
-    const chat = await msg.getChat();
+    // 3. Notificar y expulsar
     const contact = await client.getContactById(senderId).catch(()=>null);
-
-    await chat.sendMessage(`⚠️ @${senderId.split('@')[0]} — Enlace detectado (${warnCount}/${MAX_WARNINGS}).`, { mentions: contact ? [contact] : [] });
+    await chat.sendMessage(`⚠️ @${senderId.split('@')[0]} ¡Prohibido enviar enlaces! Advertencia ${warnCount}/${MAX_WARNINGS}`, { mentions: contact ? [contact] : [] });
 
     if (warnCount >= MAX_WARNINGS) {
       try {
         await chat.removeParticipants([senderId]);
-        await chat.sendMessage(`🚫 @${senderId.split('@')[0]} expulsado por exceso de advertencias.`, { mentions: contact ? [contact] : [] });
+        await chat.sendMessage(`🚫 @${senderId.split('@')[0]} ha sido expulsado por ignorar las reglas.`, { mentions: contact ? [contact] : [] });
+        // Limpiar advertencias tras expulsión
         if (USE_DB) await pool.query('DELETE FROM warnings WHERE user_id=$1', [senderId]);
-      } catch(e) { console.warn('Error al expulsar:', e.message); }
+      } catch(e) { console.error('Error al intentar expulsar:', e.message); }
     }
   } catch (err) { console.error('Error en moderación:', err); }
 });
 
-// Servidor Express
-const app = express();
+// --- SERVIDOR EXPRESS Y ADMIN UI ---
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Ver QR desde navegador
+app.get('/qr', async (req, res) => {
+  if (!lastQr) return res.send('<h3>El QR no está disponible. Revisa si el bot ya está conectado.</h3>');
+  res.setHeader('Content-Type', 'image/png');
+  await QRCode.toFileStream(res, lastQr);
+});
+
+// API para gestión de posts
 app.get('/api/posts', async (req,res) => res.json(await loadPosts()));
 app.post('/api/posts', async (req,res) => {
   const { message, cron_spec } = req.body;
-  if (!message) return res.status(400).json({ error:'message required' });
   const post = await savePost({ message, cron_spec, active: true });
   if (cron_spec) schedulePost(post.id, cron_spec);
   res.json(post);
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Admin UI en puerto ${PORT}`));
-
-// Planificador
-const scheduled = {};
+// --- PLANIFICADOR DE POSTS (CRON) ---
+const scheduledTasks = {};
 function schedulePost(id, cronSpec) {
-  if (scheduled[id]) { scheduled[id].stop(); delete scheduled[id]; }
-  scheduled[id] = cron.schedule(cronSpec, async () => {
+  if (scheduledTasks[id]) { scheduledTasks[id].stop(); delete scheduledTasks[id]; }
+  
+  scheduledTasks[id] = cron.schedule(cronSpec, async () => {
     try {
+      if (!GROUP_ID) return console.log('⚠️ Error: No hay GROUP_ID configurado para el post automático.');
       const posts = await loadPosts();
       const post = posts.find(p => p.id === id);
-      if (post && post.active && GROUP_ID) {
+      if (post && post.active) {
         const chat = await client.getChatById(GROUP_ID);
         await chat.sendMessage(post.message);
+        console.log(`[AUTO-POST] Enviado id: ${id}`);
       }
-    } catch(e) { console.warn('Error en post programado:', e.message); }
+    } catch(e) { console.warn('Fallo en post programado:', e.message); }
   });
 }
+
+// Iniciar cron jobs al arrancar
+(async () => {
+  const posts = await loadPosts();
+  posts.forEach(p => { if (p.cron_spec && p.active) schedulePost(p.id, p.cron_spec); });
+})();
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Admin UI en puerto ${PORT}`));
 
 client.initialize();
