@@ -1,37 +1,37 @@
-# Dockerfile - Baileys (ligero)
-FROM node:20-alpine
+# Dockerfile - Baileys (estable y simple)
+FROM node:20-bullseye-slim
 
-# variables de entorno por defecto
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV AUTH_DIR=/usr/src/app/baileys_auth
 
-# instalar utilidades necesarias (si alguna falla en alpine, quítalas)
-RUN apk add --no-cache bash tini
+# instalar utilidades necesarias
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    tini \
+  && rm -rf /var/lib/apt/lists/*
 
-# crear usuario no root
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+# crear usuario no-root
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 
 WORKDIR /usr/src/app
 
-# copiar package.json y lock para aprovechar cache de capa
+# copiar package.json (mejor caché de capas)
 COPY package.json package-lock.json* ./
 
-# instalar dependencias (solo prod)
-RUN npm ci --only=production --no-progress || npm install --production --no-progress
+# instalar dependencias (sin dev)
+RUN npm install --omit=dev --no-progress
 
-# copiar el código
+# copiar el resto del código
 COPY . .
 
-# crear carpeta para auth y darle permisos
+# crear carpeta para auth y dar permisos
 RUN mkdir -p ${AUTH_DIR} && chown -R appuser:appgroup /usr/src/app
 
-# exponer puerto
 EXPOSE 3000
 
-# usamos tini para pid1 y manejos de signals
 USER appuser
 
-# comando por defecto
-ENTRYPOINT ["/sbin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "mod-bot-baileys-full.js"]
