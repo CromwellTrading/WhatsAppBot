@@ -1,32 +1,32 @@
-# Dockerfile - Baileys (estable y simple)
+# Dockerfile - Recomendado para Render (estabilidad y compatibilidad)
 FROM node:20-bullseye-slim
 
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV AUTH_DIR=/usr/src/app/baileys_auth
 
-# instalar utilidades necesarias
+# utilidades necesarias (git porque algunas dependencias pueden venir por git)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
     tini \
   && rm -rf /var/lib/apt/lists/*
 
-# crear usuario no-root
+# usuario no-root
 RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 
 WORKDIR /usr/src/app
 
-# copiar package.json (mejor caché de capas)
+# copiar package.json (cache de capas)
 COPY package.json package-lock.json* ./
 
-# instalar dependencias (sin dev)
+# instalar dependencias sin dev
 RUN npm install --omit=dev --no-progress
 
-# copiar el resto del código
+# copiar código
 COPY . .
 
-# crear carpeta para auth y dar permisos
+# crear carpeta auth temporal
 RUN mkdir -p ${AUTH_DIR} && chown -R appuser:appgroup /usr/src/app
 
 EXPOSE 3000
