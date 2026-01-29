@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-baileys-guardian-bot",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Bot guardian de WhatsApp usando Baileys + Supabase (optimizado para Render Free)",
   "main": "mod-bot-baileys-full.js",
   "type": "commonjs",
@@ -11,7 +11,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@adiwajshing/baileys": "^6.7.8",
+    "@adiwajshing/baileys": "^5.0.0",
     "@adiwajshing/keyed-db": "^0.2.4",
     "@supabase/supabase-js": "^2.39.7",
     "express": "^4.19.2",
