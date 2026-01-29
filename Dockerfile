@@ -1,11 +1,9 @@
-# Usa bullseye para mejor compatibilidad con Chromium
-FROM node:20-bullseye
+FROM node:20-bullseye-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Evitar que puppeteer descargue su propio chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
-# Instalar chromium y dependencias del sistema
+# Instalar solo lo esencial
 RUN apt-get update && apt-get install -y \
     chromium \
     ca-certificates \
@@ -22,26 +20,38 @@ RUN apt-get update && apt-get install -y \
     libxcomposite1 \
     libxdamage1 \
     libxrandr2 \
-    xdg-utils \
-    && rm -rf /var/lib/apt/lists/*
+    wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 WORKDIR /usr/src/app
 
-# Copiamos archivos de dependencias
+# Copiar package.json primero para mejor cacheo
 COPY package*.json ./
 
-# Instalación normal (npm la genera automáticamente en el contenedor)
-RUN npm install --omit=dev --no-audit --no-fund
+# Instalar dependencias de producción
+RUN npm ci --only=production --no-audit --no-fund
 
-
-# Copiar el resto del código
+# Copiar código fuente
 COPY . .
 
-# Exponer el puerto de Express
+# Crear directorio para sesiones
+RUN mkdir -p wwebjs_auth && chmod 755 wwebjs_auth
+
+# Variables de entorno
+ENV CHROME_PATH=/usr/bin/chromium
+ENV NODE_ENV=production
+ENV PORT=3000
+
+# Exponer puerto
 EXPOSE 3000
 
-# Definir la ruta de Chromium instalada en el sistema
-ENV CHROME_PATH=/usr/bin/chromium
+# Usar usuario no root para seguridad
+USER node
 
-# Iniciar la aplicación
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/ || exit 1
+
+# Iniciar aplicación
 CMD ["node", "mod-bot-web.js"]
