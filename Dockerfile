@@ -1,39 +1,37 @@
-FROM node:20-bullseye
+# Dockerfile - Baileys (ligero)
+FROM node:20-alpine
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+# variables de entorno por defecto
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV AUTH_DIR=/usr/src/app/baileys_auth
+
+# instalar utilidades necesarias (si alguna falla en alpine, quítalas)
+RUN apk add --no-cache bash tini
+
+# crear usuario no root
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
 WORKDIR /usr/src/app
 
-RUN apt-get update && apt-get install -y \
-  chromium \
-  ca-certificates \
-  fonts-liberation \
-  libasound2 \
-  libatk-bridge2.0-0 \
-  libatk1.0-0 \
-  libcups2 \
-  libdbus-1-3 \
-  libgbm1 \
-  libnspr4 \
-  libnss3 \
-  libx11-xcb1 \
-  libxcomposite1 \
-  libxdamage1 \
-  libxrandr2 \
-  xdg-utils \
-  unzip \
-  && rm -rf /var/lib/apt/lists/*
+# copiar package.json y lock para aprovechar cache de capa
+COPY package.json package-lock.json* ./
 
-# crear carpeta (efímera) usada por LocalAuth
-RUN mkdir -p /usr/src/app/wwebjs_auth
+# instalar dependencias (solo prod)
+RUN npm ci --only=production --no-progress || npm install --production --no-progress
 
-COPY package*.json ./
-RUN npm install --omit=dev --no-audit --no-fund
-
+# copiar el código
 COPY . .
 
+# crear carpeta para auth y darle permisos
+RUN mkdir -p ${AUTH_DIR} && chown -R appuser:appgroup /usr/src/app
+
+# exponer puerto
 EXPOSE 3000
 
-ENV CHROME_PATH=/usr/bin/chromium
+# usamos tini para pid1 y manejos de signals
+USER appuser
 
-CMD ["node", "mod-bot-web.js"]
+# comando por defecto
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "mod-bot-baileys-full.js"]
