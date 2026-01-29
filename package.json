@@ -1,18 +1,18 @@
 {
-  "name": "whatsapp-moderator-web",
+  "name": "whatsapp-mod-bot",
   "version": "1.0.0",
   "main": "mod-bot-web.js",
   "scripts": {
     "start": "node mod-bot-web.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
     "body-parser": "^1.20.2",
-    "whatsapp-web.js": "^1.20.0",
+    "express": "^4.18.2",
+    "fs-extra": "^11.2.0",
+    "node-cron": "^3.0.3",
+    "pg": "^8.11.3",
+    "puppeteer": "^22.0.0",
     "qrcode-terminal": "^0.12.0",
-    "node-cron": "^3.0.2",
-    "fs-extra": "^11.1.1",
-    "pg": "^8.10.0",
-    "puppeteer": "^21.3.8"
+    "whatsapp-web.js": "^1.25.0"
   }
 }
