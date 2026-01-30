@@ -4,7 +4,8 @@ const {
   Browsers,
   initAuthCreds,
   BufferJSON,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  useMultiFileAuthState // No lo usaremos, pero es parte de la lib
 } = require('@whiskeysockets/baileys')
 
 const P = require('pino')
@@ -18,46 +19,36 @@ const PORT = process.env.PORT || 3000
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY 
 
-// Usamos un logger mínimo para ahorrar memoria en Render
-const logger = P({ level: 'error' })
+// Pega aquí el ID que conseguiste o úsalo desde ENV
+const TARGET_GROUP_ID = process.env.TARGET_GROUP_ID || '120363408042502905@g.us'
+
+// Logger nivel 'fatal' para que no llene la consola de basura (SessionErrors, etc)
+const logger = P({ level: 'fatal' })
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: false }
 })
 
 /* ================= ADAPTADOR DE AUTENTICACIÓN (SUPABASE) ================= */
-
+// ... (Esta parte es idéntica a la tuya, la resumo para ahorrar espacio) ...
 const useSupabaseAuthState = async () => {
   const writeData = async (data, key) => {
     try {
       await supabase
         .from('auth_sessions')
         .upsert({ key, value: JSON.stringify(data, BufferJSON.replacer) })
-    } catch (e) { 
-      console.error('Error al guardar en Supabase:', e.message) 
-    }
+    } catch (e) { console.error('Error Supabase Save', e.message) }
   }
-
   const readData = async (key) => {
     try {
-      const { data } = await supabase
-        .from('auth_sessions')
-        .select('value')
-        .eq('key', key)
-        .maybeSingle()
+      const { data } = await supabase.from('auth_sessions').select('value').eq('key', key).maybeSingle()
       return data?.value ? JSON.parse(data.value, BufferJSON.reviver) : null
     } catch (e) { return null }
   }
-
   const removeData = async (key) => {
-    try {
-      await supabase.from('auth_sessions').delete().eq('key', key)
-    } catch (e) { }
+    try { await supabase.from('auth_sessions').delete().eq('key', key) } catch (e) { }
   }
-
-  // Cargamos las credenciales base
   const creds = (await readData('creds')) || initAuthCreds()
-
   return {
     state: {
       creds,
@@ -85,9 +76,7 @@ const useSupabaseAuthState = async () => {
         }
       }
     },
-    saveCreds: async () => {
-      await writeData(creds, 'creds')
-    }
+    saveCreds: async () => { await writeData(creds, 'creds') }
   }
 }
 
@@ -95,13 +84,22 @@ const useSupabaseAuthState = async () => {
 
 let latestQR = null
 let sock = null
+let intervalID = null // Para controlar el saludo automático
+
+// Frases aleatorias para parecer humano
+const saludos = [
+  "Hola a todos, ¿cómo va el día?",
+  "Buenas, ¿qué tal todo por aquí?",
+  "Saludos grupo, espero que estén bien.",
+  "Hola, pasaba a saludar.",
+  "¿Todo en orden por aquí? Saludos.",
+  "Buenas tardes/noches a todos."
+]
 
 async function startBot() {
   console.log('--- Iniciando instancia del Bot ---')
   
   const { state, saveCreds } = await useSupabaseAuthState()
-  
-  // Obtenemos la versión más reciente de WhatsApp Web para evitar bloqueos
   const { version } = await fetchLatestBaileysVersion()
 
   sock = makeWASocket({
@@ -109,47 +107,40 @@ async function startBot() {
     auth: state,
     printQRInTerminal: false,
     logger,
-    // Browser configurado como Chrome en Ubuntu para mayor compatibilidad en Render
     browser: ["Ubuntu", "Chrome", "20.0.04"],
-    syncFullHistory: false, // ¡IMPORTANTE! Ahorra mucha memoria RAM
+    syncFullHistory: false,
     generateHighQualityLinkPreview: false,
     connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 0,
   })
 
-  // Guardar credenciales cada vez que se actualizan
   sock.ev.on('creds.update', saveCreds)
 
-  // Manejo de conexión
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update
 
-    if (qr) {
-      latestQR = qr
-      console.log('⚠️ NUEVO QR GENERADO: Accede a la URL de Render /qr para escanear.')
-    }
-
+    if (qr) latestQR = qr
+    
     if (connection === 'close') {
+      // Limpiamos el intervalo si se desconecta para no duplicar
+      if (intervalID) clearInterval(intervalID)
+      
       const statusCode = lastDisconnect?.error?.output?.statusCode
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+      console.log(`❌ Conexión cerrada. Reconectando: ${shouldReconnect}`)
       
-      console.log(`❌ Conexión cerrada. Razón: ${statusCode}. Reconectando: ${shouldReconnect}`)
-      
-      if (shouldReconnect) {
-        // Delay de 5 segundos antes de reintentar para no saturar el servidor
-        setTimeout(startBot, 5000)
-      } else {
-        console.log('🚫 Sesión finalizada. Debes borrar la tabla en Supabase y volver a escanear.')
-      }
+      if (shouldReconnect) setTimeout(startBot, 5000)
     }
 
     if (connection === 'open') {
       console.log('✅ ¡CONEXIÓN EXITOSA! WhatsApp está activo.')
       latestQR = null
+      
+      // Iniciamos el ciclo de saludos automáticos
+      iniciarSaludosAutomaticos()
     }
   })
 
-  // Escuchar mensajes para obtener IDs de grupos y procesar enlaces
+  // === PROCESAMIENTO DE MENSAJES ===
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return 
 
@@ -157,63 +148,83 @@ async function startBot() {
       if (!msg.message || msg.key.fromMe) continue
       
       const remoteJid = msg.key.remoteJid
-      const messageText = msg.message?.conversation || 
-                          msg.message?.extendedTextMessage?.text || 
-                          ''
 
-      // LOGS EN CONSOLA: Aquí verás los IDs de los grupos para tu prueba
-      console.log('------------------------------------')
-      console.log(`📩 MENSAJE RECIBIDO`)
-      console.log(`🆔 ID JID: ${remoteJid}`)
-      console.log(`👤 DE: ${msg.pushName || 'Desconocido'}`)
-      console.log(`📝 TEXTO: ${messageText}`)
-      console.log('------------------------------------')
+      // 1. FILTRO DE MEMORIA: Si no es el grupo objetivo, ignorar
+      if (remoteJid !== TARGET_GROUP_ID) return
+
+      const messageText = msg.message?.conversation || 
+                          msg.message?.extendedTextMessage?.text || ''
+
+      // 2. DETECTOR DE ENLACES
+      // Regex busca http://, https:// o www.
+      const urlRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)/gi;
       
-      // Filtro para solo procesar si hay un enlace (ahorro de recursos)
-      if (messageText.includes('http')) {
-        console.log(`🔗 Enlace detectado en ${remoteJid}. Procesando...`)
-        // Aquí puedes añadir tu lógica de posteo automático
+      if (urlRegex.test(messageText)) {
+        console.log(`🚨 Enlace detectado de ${msg.pushName}: ${messageText}`)
+        
+        try {
+          // Primero borramos el mensaje (clave para borrar: remoteJid, fromMe, id)
+          await sock.sendMessage(remoteJid, { delete: msg.key })
+          console.log('🗑️ Mensaje eliminado correctamente.')
+          
+          // Opcional: Advertencia
+          // await sock.sendMessage(remoteJid, { text: '🚫 Prohibidos los enlaces.' })
+        } catch (error) {
+          console.log('⚠️ No pude borrar el mensaje. ¿Soy Admin del grupo?')
+        }
       }
     }
   })
 }
 
-// Iniciar el proceso
+// === FUNCIÓN SALUDO AUTOMÁTICO ===
+function iniciarSaludosAutomaticos() {
+  if (intervalID) clearInterval(intervalID)
+
+  console.log('⏰ Sistema de saludos automáticos activado.')
+
+  // Función interna que se llama a sí misma para variar el tiempo
+  const programarSiguienteSaludo = () => {
+    // Tiempo aleatorio entre 30 y 45 minutos (en milisegundos)
+    // 30 min = 1,800,000 ms
+    // 45 min = 2,700,000 ms
+    const minTime = 1800000 
+    const maxTime = 2700000
+    const tiempoEspera = Math.floor(Math.random() * (maxTime - minTime + 1) + minTime)
+    
+    console.log(`⏳ Próximo saludo en ${(tiempoEspera / 60000).toFixed(1)} minutos`)
+
+    intervalID = setTimeout(async () => {
+      if (!sock) return
+
+      const frase = saludos[Math.floor(Math.random() * saludos.length)]
+      
+      try {
+        await sock.sendMessage(TARGET_GROUP_ID, { text: frase })
+        console.log(`🤖 Saludo enviado: "${frase}"`)
+      } catch (e) {
+        console.error('Error enviando saludo automático', e)
+      }
+
+      // Reprogramar el siguiente
+      programarSiguienteSaludo()
+
+    }, tiempoEspera)
+  }
+
+  programarSiguienteSaludo()
+}
+
 startBot()
 
-/* ================= SERVIDOR WEB (EXPRESS) ================= */
-
+/* ================= SERVIDOR WEB ================= */
 const app = express()
-
-app.get('/', (req, res) => {
-  res.send('Servidor del Bot funcionando correctamente ✅')
-})
-
+app.get('/', (req, res) => res.send('Bot Activo 🤖'))
 app.get('/qr', async (req, res) => {
-  if (sock?.authState?.creds?.me?.id) {
-    return res.send('<h3>El bot ya está vinculado y funcionando.</h3>')
-  }
-  
-  if (!latestQR) {
-    return res.send('<h3>Generando código QR... por favor refresca en 10 segundos.</h3>')
-  }
-  
+  if (!latestQR) return res.send('<h3>Bot ya conectado o generando QR... refresca en 10s.</h3>')
   try {
     const qrImage = await QRCode.toDataURL(latestQR)
-    res.send(`
-      <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; font-family:sans-serif; background:#f0f2f5;">
-        <div style="background:white; padding:20px; border-radius:15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align:center;">
-          <h2 style="color:#128c7e;">Escanea con WhatsApp</h2>
-          <img src="${qrImage}" style="width:300px; height:300px; border:1px solid #ddd;"/>
-          <p style="margin-top:15px; color:#555;">El código se actualizará automáticamente si expira.</p>
-        </div>
-      </div>
-    `)
-  } catch (err) {
-    res.status(500).send('Error al generar la imagen del QR')
-  }
+    res.send(`<img src="${qrImage}" />`)
+  } catch (err) { res.status(500).send('Error QR') }
 })
-
-app.listen(PORT, () => {
-  console.log(`🌐 Servidor HTTP activo en el puerto ${PORT}`)
-})
+app.listen(PORT, () => console.log(`🌐 Servidor en puerto ${PORT}`))
