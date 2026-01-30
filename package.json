@@ -1,21 +1,19 @@
 {
-  "name": "whatsapp-baileys-guardian-bot",
-  "version": "1.0.3",
-  "description": "Bot guardian de WhatsApp usando Baileys + Supabase",
+  "name": "whatsapp-baileys-render-free",
+  "version": "1.0.0",
+  "description": "WhatsApp bot optimizado para Render Free",
   "main": "mod-bot-baileys-full.js",
-  "type": "commonjs",
-  "scripts": {
-    "start": "node mod-bot-baileys-full.js"
-  },
   "engines": {
     "node": ">=18"
   },
+  "scripts": {
+    "start": "node mod-bot-baileys-full.js"
+  },
   "dependencies": {
-    "@adiwajshing/baileys": "^5.0.0",
+    "@whiskeysockets/baileys": "^6.7.9",
     "@supabase/supabase-js": "^2.39.7",
     "express": "^4.19.2",
-    "node-cron": "^3.0.3",
-    "qrcode": "^1.5.4",
-    "pino": "^8.0.0"
+    "pino": "^8.17.0",
+    "qrcode": "^1.5.4"
   }
 }
