@@ -3,16 +3,16 @@
  * Bot completo para WhatsApp usando Baileys + OpenRouter (openrouter/free por defecto)
  * Producción: NO usa dotenv. Debes inyectar env vars en tu plataforma (Render).
  *
- * Variables requeridas en ENV:
+ * Variables requeridas:
  * - OPENROUTER_API_KEY  (REQUIRED)
- * - TARGET_GROUP_ID     (RECOMMENDED, si quieres moderar un grupo)
+ * - TARGET_GROUP_ID     (RECOMMENDED)
  * - ADMIN_WHATSAPP_ID   (RECOMMENDED)
- * - SUPABASE_URL        (optional, para persistir credenciales)
+ * - SUPABASE_URL        (optional)
  * - SUPABASE_SERVICE_ROLE_KEY (optional)
  * - OPENROUTER_MODEL    (optional, default: openrouter/free)
  * - PORT                (optional, default: 3000)
  *
- * Nota: No subas keys al repo. Usa Render Secrets / Env Vars.
+ * NOTA: Este fichero incluye logging temporal para debug. Quita los logs cuando obtengas los IDs.
  */
 
 const {
@@ -56,7 +56,12 @@ let latestQR = null;
 let sock = null;
 let intervalID = null;
 
-// Simple FIFO queue para llamadas a la IA
+// ===== LOGGING TEMPORAL =====
+// Estos sets ayudan a recoger IDs vistos; borralos cuando termines debug.
+let lastSeenGroupIds = new Set();
+let lastSeenParticipants = new Set();
+let lastSeenAdminCandidate = null;
+
 class SimpleQueue {
   constructor() {
     this.tasks = [];
@@ -80,7 +85,6 @@ class SimpleQueue {
       next.rej(e);
     } finally {
       this.running = false;
-      // pequeño throttle para no golpear rate limits
       setTimeout(() => this._runNext(), 250);
     }
   }
@@ -112,22 +116,18 @@ const ignoredMessages = [
   "Parece que me dejaron sola 🥲"
 ];
 
-// Palabras clave (heurísticas; no son absolutas — se pueden ampliar en el futuro)
 const POLITICS_RELIGION_KEYWORDS = ['política','político','gobierno','religión','dios','iglesia','ateo','creencia','inmigración'];
 const OFFERS_KEYWORDS = ['oferta','ofertas','precio','vender','compra','rebaja','promo','promoción','pago'];
 const urlRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)/gi;
 
-// Saludos (detector)
+// Saludos
 const GREETINGS = [
   'hola','holaa','buenas','buenas tardes','buenas noches','buen día','buenos días',
   'hey','hi','hello','ola','qué tal','quetal','qué onda','q onda'
 ];
+const lastGreetingTime = {}; // cooldown por participante
+const GREETING_COOLDOWN = 1000 * 60 * 10; // 10 min
 
-// Para evitar múltiples respuestas a saludos del mismo usuario en poco tiempo
-const lastGreetingTime = {}; // key: participant JID, value: timestamp
-const GREETING_COOLDOWN = 1000 * 60 * 10; // 10 min por usuario
-
-// sanitize text: quitar asteriscos y limpieza
 function sanitizeAI(text) {
   if (!text) return '';
   text = String(text);
@@ -137,7 +137,7 @@ function sanitizeAI(text) {
   return text.trim();
 }
 
-// ========== SYSTEM PROMPT (SST) ==========
+// ========== SYSTEM PROMPT ==========
 const SYSTEM_PROMPT = `
 Eres "Shiro Synthesis Two", una asistente virtual femenina joven (aparentas <20 años) inspirada en chicas anime sin ser extrema otaku. Tu meta es ayudar y moderar un grupo de recargas de juegos. Tu nombre completo es Shiro Synthesis Two; puedes usar "SST" si el usuario lo menciona, pero preséntate siempre con el nombre completo la primera vez que hablas con alguien.
 
@@ -172,7 +172,7 @@ Actualidad y límites:
 Fin del prompt.
 `;
 
-// ========== OPENROUTER (call) ==========
+// ========== OPENROUTER CALL ==========
 async function callOpenRouter(messages /* array {role,content} */) {
   try {
     const payload = { model: OPENROUTER_MODEL, messages };
@@ -185,7 +185,6 @@ async function callOpenRouter(messages /* array {role,content} */) {
       return null;
     }
     const choice = res.data?.choices?.[0];
-    // soporte para varias estructuras
     const content = choice?.message?.content ?? choice?.message ?? choice?.text ?? null;
     if (!content) return null;
     return sanitizeAI(String(content));
@@ -198,7 +197,6 @@ async function callOpenRouter(messages /* array {role,content} */) {
 // ========== AUTH (Supabase o fallback memoria) ==========
 const useSupabaseAuthState = async () => {
   if (!supabaseClient) {
-    // fallback in-memory (útil si no config de supabase)
     console.warn('⚠️ Supabase no configurado. Usando store de credenciales en memoria (no persistente).');
     const creds = initAuthCreds();
     const storeKeys = {};
@@ -298,6 +296,9 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = update;
     if (qr) latestQR = qr;
 
+    // LOG: cuando cambia la conexión
+    console.log(`[LOG][CONN] connection=${connection}`, lastDisconnect ? { code: lastDisconnect?.error?.output?.statusCode } : '');
+
     if (connection === 'close') {
       if (intervalID) clearInterval(intervalID);
       const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -309,14 +310,25 @@ async function startBot() {
     if (connection === 'open') {
       console.log('✅ Conectado WhatsApp. SST activa.');
       latestQR = null;
+      // LOG: intenta obtener bot id si está disponible
+      try {
+        const botId = sock?.user?.id || (state && state.creds && state.creds.me && state.creds.me.id) || 'unknown-bot-id';
+        console.log(`[LOG] Bot conectado como: ${botId}`);
+      } catch (e) {
+        console.log('[LOG] No pude determinar botId:', e?.message || e);
+      }
       iniciarSaludosAutomaticos();
       startSilenceChecker();
     }
   });
 
-  // === Bienvenida a nuevos participantes ===
+  // === Bienvenida a nuevos participantes (y LOG) ===
   sock.ev.on('group-participants.update', async (update) => {
     try {
+      console.log(`[LOG][GROUP_UPDATE] group=${update.id} action=${update.action} participants=${JSON.stringify(update.participants)}`);
+      update.participants?.forEach(p => lastSeenParticipants.add(p));
+      if (update.id) lastSeenGroupIds.add(update.id);
+
       const { id, participants, action } = update;
       if (id !== TARGET_GROUP_ID) return;
       if (action === 'add') {
@@ -329,12 +341,29 @@ async function startBot() {
     } catch (e) { console.error('Welcome error', e); }
   });
 
-  // === Procesamiento de mensajes ===
+  // === Procesamiento de mensajes (con LOG) ===
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages) {
       try {
         if (!msg.message || msg.key.fromMe) continue;
+
+        // ===== LOG TEMPORAL para detectar IDs =====
+        try {
+          const remoteJid = msg.key.remoteJid || 'unknown-remote';
+          const participant = msg.key.participant || msg.key.remoteJid || 'unknown-participant';
+          const pushName = msg.pushName || 'unknown-name';
+          console.log(`[LOG][MSG] remoteJid=${remoteJid} participant=${participant} pushName="${pushName}"`);
+          if (remoteJid) lastSeenGroupIds.add(remoteJid);
+          if (participant) lastSeenParticipants.add(participant);
+          if (process.env.ADMIN_WHATSAPP_ID && participant === process.env.ADMIN_WHATSAPP_ID) {
+            lastSeenAdminCandidate = participant;
+            console.log(`[LOG][ADMIN] Visto admin candidate: ${participant}`);
+          }
+        } catch (e) {
+          console.log('Error logging message info:', e?.message || e);
+        }
+        // ===== fin LOG =====
 
         const remoteJid = msg.key.remoteJid;
         const isPrivateChat = remoteJid && remoteJid.endsWith('@s.whatsapp.net');
@@ -350,10 +379,9 @@ async function startBot() {
 
         const plainLower = (messageText || '').toLowerCase();
 
-        // update lastActivity si es el grupo objetivo
         if (isTargetGroup) lastActivity = Date.now();
 
-        // RESPONDER A PRIVADOS: avisar que solo atiende por el grupo
+        // RESPONDER A PRIVADOS
         if (isPrivateChat) {
           await sock.sendMessage(remoteJid, {
             text: 'Lo siento, mi servicio funciona SOLO por el grupo. Contacta al admin para atención privada.'
@@ -361,18 +389,15 @@ async function startBot() {
           continue;
         }
 
-        // Si no es el grupo objetivo, ignorar (si TARGET_GROUP_ID no está configurado, opcionalmente podrías procesar todos)
         if (!isTargetGroup) continue;
 
-        // === DETECCIÓN DE ENLACES ===
+        // DETECCIÓN DE ENLACES
         if (urlRegex.test(messageText)) {
           console.log('Link detectado:', messageText);
           try {
-            // intenta borrar el mensaje (requiere ser admin)
             await sock.sendMessage(remoteJid, { delete: msg.key });
             const warnText = `🚫 @${msg.pushName || (msg.key.participant || '').split('@')[0]} — Enlaces no permitidos aquí. No insistas.`;
             const cleaned = sanitizeAI(warnText);
-            // Advertencia importante -> firmamos
             await sock.sendMessage(remoteJid, { text: cleaned + '\n\n— Shiro Synthesis Two' }, { quoted: msg });
           } catch (e) {
             console.log('No pude borrar el mensaje (¿soy admin?)', e?.message || e);
@@ -381,85 +406,73 @@ async function startBot() {
           continue;
         }
 
-        // === POLÍTICA / RELIGIÓN (contextual) ===
+        // POLÍTICA / RELIGIÓN (contextual)
         if (POLITICS_RELIGION_KEYWORDS.some(k => plainLower.includes(k))) {
           const containsDebateTrigger = plainLower.includes('gobierno') || plainLower.includes('política') || plainLower.includes('impuesto') || plainLower.includes('ataque') || plainLower.includes('insulto');
           if (containsDebateTrigger) {
             await sock.sendMessage(remoteJid, { text: '⚠️ Este grupo evita debates políticos/religiosos. Cambiemos de tema, por favor.' }, { quoted: msg });
             continue;
-          } // si no hay trigger, ignorar mención casual
+          }
         }
 
-        // === OFERTAS / REDIRECCIÓN A ADMIN ===
+        // OFERTAS / REDIRECCIÓN A ADMIN
         if (OFFERS_KEYWORDS.some(k => plainLower.includes(k))) {
           const txt = `📢 @${msg.pushName || (msg.key.participant || '').split('@')[0]}: Para ofertas y ventas, contacta al admin Asche Synthesis One por privado.`;
           await sock.sendMessage(remoteJid, { text: txt }, { quoted: msg });
           continue;
         }
 
-        // === SALUDOS: responder si detecta saludo corto ===
-        // heurística: si el mensaje es solo un saludo o contiene saludo al inicio
+        // SALUDOS
         const trimmed = (messageText || '').trim().toLowerCase();
         const isGreeting = GREETINGS.some(g => {
-          // match whole word or start with greeting
           return trimmed === g || trimmed.startsWith(g + ' ') || trimmed.startsWith(g + '!');
         });
 
         if (isGreeting) {
-          // evitar responder a saludos repetidos del mismo usuario en corto tiempo
           const participant = msg.key.participant || msg.key.remoteJid;
           const lastTime = lastGreetingTime[participant] || 0;
           const now = Date.now();
           if (now - lastTime > GREETING_COOLDOWN) {
             lastGreetingTime[participant] = now;
-            // Responder con saludo corto + firma + aclaración de IA
             const reply = `¡Hola ${msg.pushName || ''}! 😄\nSoy Shiro Synthesis Two — asistente virtual del grupo. Si necesitas recargas o preguntas, mencióname o escribe tu duda aquí.`;
             await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
-          } // else no responder
+          }
           continue;
         }
 
-        // === DECIDIR SI USAR IA (direccionado o pregunta) ===
+        // DECIDIR USAR IA
         const addressedToShiro = /\b(shiro synthesis two|shiro|sst)\b/i.test(messageText);
         const askKeywords = ['qué','que','cómo','como','por qué','por que','ayuda','explica','explicar','cómo hago','cómo recargo','?','dónde','donde','precio','cuánto','cuanto'];
         const looksLikeQuestion = messageText.includes('?') || askKeywords.some(k => plainLower.includes(k));
         const shouldUseAI = addressedToShiro || looksLikeQuestion;
 
         if (shouldUseAI) {
-          // confirmar posición en cola
           const queuePosEstimate = aiQueue.length() + 1;
           await sock.sendMessage(remoteJid, {
             text: `⏳ @${msg.pushName || (msg.key.participant || '').split('@')[0]} — Recibido. Estoy en la cola (#${queuePosEstimate}).`
           }, { quoted: msg });
 
-          // encolar la tarea
           aiQueue.enqueue(async () => {
-            // montar prompt
             const messagesForAI = [
               { role: 'system', content: SYSTEM_PROMPT },
               { role: 'user', content: messageText }
             ];
             const aiResp = await callOpenRouter(messagesForAI);
             let replyText = aiResp || 'Lo siento, no puedo generar una respuesta ahora. Consulta con el admin si es urgente.';
-            // Si el texto sugiere incertidumbre, añadimos nota sobre actualización de datos
             if (/no estoy segura|no estoy segura|no sé|no se/i.test(replyText)) {
               replyText += '\n\nNota: mi información puede estar desactualizada; consulta con Asche para confirmar.';
             }
             replyText = sanitizeAI(replyText);
-
-            // decidir si firmar: heurística: contiene advertencia o admin o es muy largo
             const important = /🚫|⚠️|admin|oferta|ofertas|precio/i.test(replyText) || replyText.length > 300;
             if (important && !replyText.includes('— Shiro Synthesis Two')) {
               replyText += `\n\n— Shiro Synthesis Two`;
             }
-
-            // enviar citando el mensaje original
             await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
             return true;
           }).catch(e => console.error('AI queue task failed', e));
         }
 
-        // => si no se cumple nada, por defecto no respondemos (parasitismo mínimo)
+        // si nada aplica, no respondemos
       } catch (err) {
         console.error('Error procesando mensaje', err);
       }
@@ -467,7 +480,7 @@ async function startBot() {
   });
 }
 
-// ========== SILENCE CHECKER (nudges) ==========
+// ========== SILENCE CHECKER ==========
 function startSilenceChecker() {
   setInterval(async () => {
     try {
@@ -479,13 +492,10 @@ function startSilenceChecker() {
           await sock.sendMessage(TARGET_GROUP_ID, { text: nudge });
           lastNudgeTime = Date.now();
           nudgeSent = true;
-          // esperar ventana de respuesta
           setTimeout(() => {
             if (lastActivity <= lastNudgeTime) {
-              // nadie respondió -> cooldown 2-3h
               const cooldown = MIN_COOLDOWN + Math.floor(Math.random() * (MAX_COOLDOWN - MIN_COOLDOWN + 1));
               silentCooldownUntil = Date.now() + cooldown;
-              // planificar "me están ignorando" después del cooldown si sigue sin actividad
               setTimeout(async () => {
                 if (lastActivity <= lastNudgeTime && Date.now() >= silentCooldownUntil) {
                   const ignored = ignoredMessages[Math.floor(Math.random() * ignoredMessages.length)];
@@ -493,7 +503,6 @@ function startSilenceChecker() {
                 }
               }, cooldown + 1000);
             } else {
-              // hubo respuesta -> reset
               nudgeSent = false;
             }
           }, RESPONSE_WINDOW_AFTER_NUDGE);
@@ -505,7 +514,7 @@ function startSilenceChecker() {
   }, 60 * 1000);
 }
 
-// ========== SALUDOS AUTOMÁTICOS (opcional) ==========
+// ========== SALUDOS AUTOMÁTICOS ==========
 function iniciarSaludosAutomaticos() {
   if (intervalID) clearTimeout(intervalID);
   const programar = () => {
@@ -526,24 +535,24 @@ function iniciarSaludosAutomaticos() {
 // ========== INICIO ==========
 startBot().catch(e => console.error('Error init bot', e));
 
-// ========== SERVIDOR WEB (status + QR) ==========
+// ========== SERVIDOR WEB (status + QR + debug-ids) ==========
 const app = express();
 app.get('/', (req, res) => res.send('Bot Activo 🤖'));
 app.get('/qr', async (req, res) => {
   if (!latestQR) return res.send('<h3>Bot ya conectado o generando QR... refresca en 10s.</h3>');
   try { const qrImage = await QRCode.toDataURL(latestQR); res.send(`<img src="${qrImage}" />`); } catch (err) { res.status(500).send('Error QR'); }
 });
+// Endpoint temporal para ver ids detectados (debug)
+app.get('/debug-ids', (req, res) => {
+  res.json({
+    lastSeenGroupIds: Array.from(lastSeenGroupIds),
+    lastSeenParticipants: Array.from(lastSeenParticipants),
+    lastSeenAdminCandidate
+  });
+});
 app.listen(PORT, () => console.log(`🌐 Servidor en puerto ${PORT}`));
 
 // ========== Graceful shutdown ==========
-process.on('SIGINT', () => {
-  console.log('SIGINT recibido. Cerrando...');
-  process.exit(0);
-});
-process.on('SIGTERM', () => {
-  console.log('SIGTERM recibido. Cerrando...');
-  process.exit(0);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled Rejection:', reason);
-});
+process.on('SIGINT', () => { console.log('SIGINT recibido. Cerrando...'); process.exit(0); });
+process.on('SIGTERM', () => { console.log('SIGTERM recibido. Cerrando...'); process.exit(0); });
+process.on('unhandledRejection', (reason) => { console.error('Unhandled Rejection:', reason); });
