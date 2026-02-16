@@ -1,7 +1,7 @@
 /**
  * sst-bot.js
  * Bot completo para WhatsApp usando Baileys + OpenRouter (con failover de modelos gratuitos)
- * Versión mejorada: con historia de fondo, control de repeticiones y personalidad avanzada.
+ * Versión definitiva: historia de fondo, control de repeticiones, personalidad avanzada y hora corregida.
  */
 
 const {
@@ -42,6 +42,14 @@ const DUPLICATE_MESSAGE_WINDOW = 5 * 60 * 1000;   // 5 minutos para detectar dup
 const SIMILARITY_THRESHOLD = 0.6;                 // Umbral para considerar mensajes similares (evitar repetición)
 const USER_COOLDOWN_MS = 5000;                     // 5 segundos entre respuestas al mismo usuario
 
+if (!OPENROUTER_API_KEY) {
+  console.error('❌ ERROR: OPENROUTER_API_KEY no está configurada. Ponla en las env vars y vuelve a intentar.');
+  process.exit(1);
+}
+
+// Logger de Pino (solo nivel fatal para no saturar)
+const logger = P({ level: 'fatal' });
+
 // ========== SUPABASE CLIENT (opcional) ==========
 let supabaseClient = null;
 if (SUPABASE_URL && SUPABASE_KEY) {
@@ -66,7 +74,6 @@ let inMemoryWarnings = new Map();           // key: participant, value: { count:
 let inMemoryUserMemory = new Map();          // key: participant, value: { data: object, updated: timestamp }
 let inMemoryRespondedMessages = new Map();   // key: participant, value: Array de { text, response, timestamp }
 let inMemorySuggestions = [];                // array de { participant, name, text, timestamp, reviewed: false }
-let inMemoryBotMessages = [];                 // para respuestas del bot (también se guardan en messageHistory)
 let inMemoryLastUserMessages = new Map();     // key: participant, value: { text, timestamp } (último mensaje para detectar duplicados)
 let inMemoryLastResponseTime = new Map();     // key: participant, value: timestamp (última vez que se le respondió)
 
@@ -75,7 +82,6 @@ class SmartQueue {
   constructor() {
     this.tasks = new Map(); // clave: usuario, valor: { task, timestamp }
     this.processing = false;
-    this.timeout = null;
   }
 
   enqueue(participant, task) {
@@ -122,7 +128,6 @@ class SmartQueue {
   clear() {
     this.tasks.clear();
     this.processing = false;
-    if (this.timeout) clearTimeout(this.timeout);
   }
 }
 const aiQueue = new SmartQueue();
@@ -651,7 +656,7 @@ async function startBot() {
     version,
     auth: state,
     printQRInTerminal: false,
-    logger,
+    logger, // <-- aquí se usa logger
     browser: ['Ubuntu', 'Chrome', '20.0.04'],
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
