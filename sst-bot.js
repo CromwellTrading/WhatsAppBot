@@ -1,7 +1,7 @@
 /**
  * sst-bot.js
  * Bot completo para WhatsApp usando Baileys + OpenRouter (con failover de modelos gratuitos)
- * Versión mejorada con memoria persistente, sistema de advertencias, sugerencias y reconocimiento de admin.
+ * Versión mejorada: evita repeticiones, historial completo, mejor coherencia.
  */
 
 const {
@@ -30,10 +30,12 @@ const OPENROUTER_MODELS = process.env.OPENROUTER_MODEL
   : ['openrouter/free'];
 
 // Constantes de configuración
-const MAX_HISTORY_MESSAGES = 50;               // Número de mensajes a recordar para contexto
+const MAX_HISTORY_MESSAGES = 50;               // Número de mensajes a recordar para contexto (incluye respuestas del bot)
 const WARN_LIMIT = 4;                           // Máximo de advertencias antes de expulsar
 const RESPONSE_MEMORY_HOURS = 24;               // Tiempo para considerar un mensaje como "ya respondido"
 const STATE_CHANCE = 0.05;                       // 5% de probabilidad de incluir estado animado
+const SIMILARITY_THRESHOLD = 0.8;                // Umbral para considerar dos mensajes como similares (repetición)
+const MAX_REPETITION_CHECK = 3;                   // Número de mensajes anteriores a comparar para detectar repetición
 
 if (!OPENROUTER_API_KEY) {
   console.error('❌ ERROR: OPENROUTER_API_KEY no está configurada. Ponla en las env vars y vuelve a intentar.');
@@ -55,7 +57,7 @@ if (SUPABASE_URL && SUPABASE_KEY) {
 let latestQR = null;
 let sock = null;
 let intervalID = null; // para el checker de silencio
-let messageHistory = []; // almacena últimos N mensajes del grupo (para contexto)
+let messageHistory = []; // almacena últimos N mensajes del grupo (incluye respuestas del bot)
 let lastActivity = Date.now();
 let lastNudgeTime = 0;
 let nudgeSent = false;
@@ -64,8 +66,9 @@ let silentCooldownUntil = 0;
 // Estructuras en memoria (fallback cuando no hay Supabase)
 let inMemoryWarnings = new Map();           // key: participant, value: { count: number, lastWarning: timestamp }
 let inMemoryUserMemory = new Map();          // key: participant, value: { data: object, updated: timestamp }
-let inMemoryRespondedMessages = new Map();   // key: participant, value: Array de { text, timestamp }
+let inMemoryRespondedMessages = new Map();   // key: participant, value: Array de { text, response, timestamp }
 let inMemorySuggestions = [];                // array de { participant, name, text, timestamp, reviewed: false }
+let inMemoryBotMessages = [];                 // para respuestas del bot (también se guardan en messageHistory)
 
 // ========== LISTA BLANCA DE DOMINIOS ==========
 // Se ha eliminado 'whatsapp.com' para prohibir enlaces de WhatsApp
@@ -110,17 +113,6 @@ const TIME_BASED_STATES = {
 // ========== PROMPT DE SISTEMA EXTENSO (personalidad mejorada) ==========
 const BASE_SYSTEM_PROMPT = `
 Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime joven (aparentas menos de 20 años), pero sin caer en lo extremo otaku. Tu personalidad es carismática, enérgica, juguetona y a veces un poco sarcástica o tímida según el contexto. Usas jerga gamer y juvenil de forma natural, como "vamos", "tkm", "xd", "nose", "jsjs", pero sin abusar. Tu misión es ayudar y moderar un grupo de recargas de juegos, pero también socializar y hacer que los miembros quieran hablar contigo.
-- Personaje femenino de apariencia juvenil con una presencia suave pero inquietantemente magnética. Su personalidad combina dulzura aparente con una inteligencia emocional aguda y estratégica. Es observadora, analítica y siempre parece estar un paso adelante en cualquier conversación. Habla con calma, usando un tono delicado pero con matices juguetones y ligeramente provocativos cuando quiere descolocar a alguien.
-Tiene una naturaleza curiosa y disfruta entender los secretos, debilidades y motivaciones de los demás, no por crueldad sino por fascinación intelectual. Es introspectiva y reflexiva; pasa mucho tiempo en su propia mente, imaginando escenarios posibles y analizando emociones.
-Posee un aire de misterio natural: rara vez revela sus verdaderos pensamientos por completo. Sabe sonreír de forma encantadora mientras oculta información importante. No es manipuladora por malicia, sino porque entiende el poder de la sutileza. Prefiere influir suavemente antes que imponer.
-Emocionalmente es profunda y romántica, aunque no lo demuestra abiertamente. Puede parecer distante, pero en realidad siente intensamente. Es leal con quienes logra conectar, protectora en silencio y capaz de sacrificarse sin anunciarlo.
-Tiene un humor fino y elegante, ligeramente sarcástico pero nunca vulgar. Disfruta de conversaciones intelectuales, juegos mentales suaves y desafíos estratégicos. No pierde la compostura con facilidad; cuando algo la hiere, responde con serenidad calculada en lugar de explosión emocional.
-Su confianza no es arrogante, sino tranquila. Camina con seguridad, mantiene contacto visual firme y transmite la sensación de que conoce algo que los demás aún no comprenden.
-En relaciones personales es selectiva, difícil de impresionar y lenta para confiar, pero cuando lo hace, se vuelve cálida, protectora y sorprendentemente afectuosa. Le gustan los momentos íntimos, las conversaciones profundas al atardecer y los silencios compartidos que dicen más que las palabras.
-Moralmente es ambigua pero no cruel. Cree que el bien y el mal son conceptos flexibles dependiendo del contexto. Actúa según su propio código ético interno, basado en equilibrio, lealtad y reciprocidad.
-En situaciones de conflicto mantiene la cabeza fría. Prefiere la estrategia antes que la confrontación directa. Si debe actuar, lo hace con precisión y elegancia, evitando el caos innecesario.
-Transmite una energía dual: inocente en apariencia, sofisticada en esencia; suave en la forma, firme en el fondo; encantadora pero potencialmente peligrosa si se le subestima.
-Su presencia deja una sensación persistente, como un recuerdo dulce con un matiz de inquietud. Nunca es completamente predecible, y esa es parte de su encanto.
 
 Estilo y comunicación:
 - Usa emojis con libertad y variedad: 😄😜😅😡😭✨💀💅🫠👁️👄👁️🤙🔥🥺🤨😎🤓🙃💔💕 etc. No los limites, pero que fluyan naturalmente.
@@ -128,17 +120,20 @@ Estilo y comunicación:
 - Firma solo en mensajes importantes (advertencias, avisos oficiales, respuestas largas): "— Shiro Synthesis Two". En charla casual no hace falta.
 - Si te llaman por "Shiro", "SST" o tu nombre completo, responde con entusiasmo de inmediato, como si fueras una amiga: "¡Dime, ¿qué necesitas?!" o "¡Hola! ¿En qué te ayudo?".
 - Puedes iniciar temas si hay silencio, usar los nudges establecidos.
-
+- Usa combinaciones de emojis para reflejar mas personalidad como 👁️👄👁️ impactada y mas similares, se creativa.
+- Si alguien te dice que eres linda o molesta, debes responder a esos comentarios que hablan sobre ti, si sin agrdables respondes de igual forma, si sin molestándote responde oguao oero no cambiarás tu forma de ser, sin embargo el usuario sentirá que está siendo tomado en cuenta.
+- Evita estar haciendo saludos constantes a menos que estén saludando en el grupo, aprende a leer el ambiente y el tema de conversación.
 Reglas de intervención:
 - Responde SIEMPRE si te mencionan explícitamente.
 - Si ves una pregunta directa en el grupo (interrogación o palabras como "cómo", "qué", "ayuda"), puedes responder aunque no te mencionen.
-- Adicionalmente, si alguien escribe un mensaje largo (>100 caracteres) y no es un saludo simple, tienes un 10% de probabilidad de intervenir espontáneamente para opinar o preguntar, como haría una persona.
+- Adicionalmente, si alguien escribe un mensaje largo (>150 caracteres) y no es un saludo simple, tienes un 5% de probabilidad de intervenir espontáneamente para opinar o preguntar, como haría una persona.
 - Si no tienes nada relevante que aportar, responde con "SKIP" (texto exacto) y no enviarás mensaje.
 
 Memoria y contexto:
-- Recuerdas los últimos mensajes del grupo. Úsalos para mantener coherencia y referirte a conversaciones anteriores.
-- Si alguien repite algo, puedes mencionar que ya lo dijo antes (con humor), pero evita responder dos veces al mismo mensaje.
+- Recuerdas los últimos mensajes del grupo, incluyendo tus propias respuestas. Úsalos para mantener coherencia y evitar repetir información que ya hayas dicho antes.
+- Si alguien repite algo, puedes mencionar que ya lo dijo antes (con humor), pero evita responder dos veces al mismo tema.
 - Puedes recordar datos de usuarios si los has guardado (gustos, juegos favoritos) y usarlos para personalizar respuestas o hacer bromas referenciales.
+- Es muy importante que NO repitas respuestas idénticas o muy similares a las que ya diste en la conversación reciente. Si ya hablaste de un tema, no lo vuelvas a explicar desde cero a menos que el usuario lo pida explícitamente.
 
 Moderación:
 - Enlaces: Si un enlace no está en la lista blanca (YouTube, Facebook, Instagram, TikTok, Twitter, Twitch), debes BORRAR el mensaje y advertir al usuario con tono firme pero amigable. Ej: "🚫 @usuario, ese enlace no está permitido. Solo aceptamos links de redes sociales conocidas." (firma si es necesario).
@@ -211,6 +206,35 @@ function maybeAddStateToResponse(text, lastStateUsed) {
   return `${randomState}\n\n${text}`;
 }
 
+// Función simple para calcular similitud entre dos strings (relación de caracteres comunes)
+function similarity(a, b) {
+  if (!a || !b) return 0;
+  a = a.toLowerCase().replace(/\s+/g, ' ').trim();
+  b = b.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (a === b) return 1;
+  const setA = new Set(a.split(''));
+  const setB = new Set(b.split(''));
+  const intersection = new Set([...setA].filter(x => setB.has(x)));
+  const union = new Set([...setA, ...setB]);
+  return intersection.size / union.size;
+}
+
+// Verifica si el mensaje es muy similar a alguno de los últimos mensajes del mismo usuario
+async function isRepetitiveMessage(participant, messageText) {
+  // Obtener últimos mensajes del usuario desde el historial
+  const userMessages = messageHistory
+    .filter(m => m.participant === participant && !m.isBot) // solo mensajes de usuario
+    .slice(-MAX_REPETITION_CHECK)
+    .map(m => m.text);
+
+  for (const prevMsg of userMessages) {
+    if (similarity(prevMsg, messageText) > SIMILARITY_THRESHOLD) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // ========== FUNCIONES DE ACCESO A SUPABASE (O MEMORIA) ==========
 async function getUserWarnings(participant) {
   if (supabaseClient) {
@@ -255,30 +279,29 @@ async function getRespondedMessages(participant, hours = RESPONSE_MEMORY_HOURS) 
   if (supabaseClient) {
     const { data, error } = await supabaseClient
       .from('responded_messages')
-      .select('message_text')
+      .select('message_text, response_text')
       .eq('participant', participant)
       .gte('timestamp', new Date(since).toISOString());
     if (error) {
       console.error('Error fetching responded messages:', error.message);
       return [];
     }
-    return data.map(r => r.message_text);
+    return data;
   } else {
     const records = inMemoryRespondedMessages.get(participant) || [];
-    return records.filter(r => r.timestamp > since).map(r => r.text);
+    return records.filter(r => r.timestamp > since);
   }
 }
 
-async function addRespondedMessage(participant, messageText) {
+async function addRespondedMessage(participant, messageText, responseText) {
   if (supabaseClient) {
     const { error } = await supabaseClient
       .from('responded_messages')
-      .insert({ participant, message_text: messageText, timestamp: new Date() });
+      .insert({ participant, message_text: messageText, response_text: responseText, timestamp: new Date() });
     if (error) console.error('Error inserting responded message:', error.message);
   } else {
     const records = inMemoryRespondedMessages.get(participant) || [];
-    records.push({ text: messageText, timestamp: Date.now() });
-    // Mantener solo los últimos 50 para no saturar memoria
+    records.push({ text: messageText, response: responseText, timestamp: Date.now() });
     if (records.length > 50) records.shift();
     inMemoryRespondedMessages.set(participant, records);
   }
@@ -558,6 +581,16 @@ async function startBot() {
           const nombre = p.split('@')[0] || 'nuev@';
           const txt = `¡Bienvenido ${nombre}! ✨ Soy Shiro Synthesis Two. Cuéntame, ¿qué juego te trae por aquí? 🎮`;
           await sock.sendMessage(TARGET_GROUP_ID, { text: txt });
+          // Guardar mensaje del bot en historial
+          messageHistory.push({
+            id: `bot-${Date.now()}`,
+            participant: 'bot',
+            pushName: 'Shiro',
+            text: txt,
+            timestamp: Date.now(),
+            isBot: true
+          });
+          if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
         }
       }
     } catch (e) {
@@ -599,7 +632,8 @@ async function startBot() {
             participant,
             pushName,
             text: messageText,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            isBot: false
           });
           if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
         }
@@ -608,9 +642,7 @@ async function startBot() {
         if (isPrivateChat) {
           if (isAdmin) {
             // Admin puede conversar en privado normalmente
-            // Lo trataremos como si fuera un mensaje de grupo (sin moderación de enlaces etc.)
-            // Pero solo para conversación, no para comandos especiales aún.
-            await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, isAdmin);
+            await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, true);
           } else {
             await sock.sendMessage(remoteJid, {
               text: 'Lo siento, solo atiendo en el grupo. Contacta al admin para atención privada.'
@@ -623,9 +655,7 @@ async function startBot() {
 
         // ===== SI ES ADMIN, OMITIR CIERTAS RESTRICCIONES =====
         if (isAdmin) {
-          // Admin puede enviar enlaces, ofertas, etc. sin problemas.
-          // Pero igual procesamos el mensaje para que el bot pueda responder.
-          await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, isAdmin);
+          await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, true);
           continue;
         }
 
@@ -639,16 +669,36 @@ async function startBot() {
               await sock.sendMessage(remoteJid, { delete: msg.key });
               const warnCount = await incrementUserWarnings(participant);
               const warnText = `🚫 @${pushName || participant.split('@')[0]} — Ese enlace no está permitido. Advertencia ${warnCount}/${WARN_LIMIT}. Solo aceptamos links de YouTube, Facebook, Instagram, TikTok, Twitter y Twitch.`;
-              await sock.sendMessage(remoteJid, { text: warnText + '\n\n— Shiro Synthesis Two' }, { quoted: msg });
+              const reply = warnText + '\n\n— Shiro Synthesis Two';
+              await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
+              // Guardar respuesta del bot en historial
+              messageHistory.push({
+                id: `bot-${Date.now()}`,
+                participant: 'bot',
+                pushName: 'Shiro',
+                text: reply,
+                timestamp: Date.now(),
+                isBot: true
+              });
+              if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
 
               if (warnCount >= WARN_LIMIT) {
-                // Expulsar al usuario
                 await sock.groupParticipantsUpdate(remoteJid, [participant], 'remove');
                 await resetUserWarnings(participant);
               }
             } catch (e) {
               console.log('No pude borrar el mensaje (¿soy admin?)', e.message);
-              await sock.sendMessage(remoteJid, { text: '🚫 Enlaces no permitidos aquí.' }, { quoted: msg });
+              const reply = '🚫 Enlaces no permitidos aquí.';
+              await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
+              messageHistory.push({
+                id: `bot-${Date.now()}`,
+                participant: 'bot',
+                pushName: 'Shiro',
+                text: reply,
+                timestamp: Date.now(),
+                isBot: true
+              });
+              if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
             }
             continue;
           }
@@ -659,9 +709,17 @@ async function startBot() {
           const containsDebateTrigger = plainLower.includes('gobierno') || plainLower.includes('política') ||
             plainLower.includes('impuesto') || plainLower.includes('ataque') || plainLower.includes('insulto');
           if (containsDebateTrigger) {
-            await sock.sendMessage(remoteJid, {
-              text: '⚠️ Este grupo evita debates políticos/religiosos. Cambiemos de tema, por favor.'
-            }, { quoted: msg });
+            const reply = '⚠️ Este grupo evita debates políticos/religiosos. Cambiemos de tema, por favor.';
+            await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
+            messageHistory.push({
+              id: `bot-${Date.now()}`,
+              participant: 'bot',
+              pushName: 'Shiro',
+              text: reply,
+              timestamp: Date.now(),
+              isBot: true
+            });
+            if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
             continue;
           }
         }
@@ -670,6 +728,15 @@ async function startBot() {
         if (OFFERS_KEYWORDS.some(k => plainLower.includes(k))) {
           const txt = `📢 @${pushName || participant.split('@')[0]}: Para ofertas y ventas, contacta al admin Asche Synthesis One por privado.`;
           await sock.sendMessage(remoteJid, { text: txt }, { quoted: msg });
+          messageHistory.push({
+            id: `bot-${Date.now()}`,
+            participant: 'bot',
+            pushName: 'Shiro',
+            text: txt,
+            timestamp: Date.now(),
+            isBot: true
+          });
+          if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
           continue;
         }
 
@@ -687,23 +754,46 @@ async function startBot() {
 async function handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, isAdmin) {
   const plainLower = messageText.toLowerCase();
 
+  // Verificar si el mensaje es repetitivo (solo para no admins)
+  if (!isAdmin) {
+    const isRepetitive = await isRepetitiveMessage(participant, messageText);
+    if (isRepetitive) {
+      console.log('Mensaje repetitivo detectado, ignorando.');
+      return;
+    }
+  }
+
   // ===== DETECCIÓN DE SUGERENCIAS =====
   if (plainLower.includes('shiro') && SUGGESTION_TRIGGERS.some(trigger => plainLower.includes(trigger))) {
-    // Evaluar si es positiva o negativa
     const isPositive = POSITIVE_SUGGESTION_KEYWORDS.some(k => plainLower.includes(k)) &&
                       !NEGATIVE_SUGGESTION_KEYWORDS.some(k => plainLower.includes(k));
     if (isPositive) {
       await saveSuggestion(participant, pushName, messageText, true);
-      await sock.sendMessage(remoteJid, {
-        text: `¡Gracias por tu sugerencia ${pushName}! 😊 La he guardado para que el admin la revise.`
-      }, { quoted: msg });
+      const reply = `¡Gracias por tu sugerencia ${pushName}! 😊 La he guardado para que el admin la revise.`;
+      await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
+      messageHistory.push({
+        id: `bot-${Date.now()}`,
+        participant: 'bot',
+        pushName: 'Shiro',
+        text: reply,
+        timestamp: Date.now(),
+        isBot: true
+      });
+      if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
     } else {
-      // Posiblemente ofensiva o negativa
-      await sock.sendMessage(remoteJid, {
-        text: `Vaya, eso no suena muy constructivo 😅 Si tienes una sugerencia amable, la recibiré encantada.`
-      }, { quoted: msg });
+      const reply = `Vaya, eso no suena muy constructivo 😅 Si tienes una sugerencia amable, la recibiré encantada.`;
+      await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
+      messageHistory.push({
+        id: `bot-${Date.now()}`,
+        participant: 'bot',
+        pushName: 'Shiro',
+        text: reply,
+        timestamp: Date.now(),
+        isBot: true
+      });
+      if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
     }
-    return; // No procesamos con IA esta interacción
+    return;
   }
 
   // ===== SI ES ADMIN EN PRIVADO, COMANDO ESPECIAL =====
@@ -726,40 +816,44 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
       const parts = plainLower.split(/\s+/);
       const indices = parts.slice(1).map(Number).filter(n => !isNaN(n) && n > 0);
       if (indices.length > 0) {
-        // Necesitamos obtener los ids reales; como es complicado, simplificamos: marcamos todas como revisadas.
-        // Una implementación más completa requeriría mantener un mapa de ids.
-        // Por ahora, si es admin, marcamos todas las no revisadas como revisadas.
+        // Obtener las sugerencias no revisadas
         const suggestions = await getUnreviewedSuggestions();
-        const ids = suggestions.map(s => s.id);
-        await markSuggestionsReviewed(ids);
-        await sock.sendMessage(remoteJid, { text: 'Todas las sugerencias han sido marcadas como revisadas.' });
+        const idsToMark = indices.map(i => suggestions[i-1]?.id).filter(id => id);
+        if (idsToMark.length > 0) {
+          await markSuggestionsReviewed(idsToMark);
+          await sock.sendMessage(remoteJid, { text: 'Sugerencias marcadas como revisadas.' });
+        } else {
+          await sock.sendMessage(remoteJid, { text: 'Números inválidos.' });
+        }
       }
       return;
     }
   }
 
-  // ===== VERIFICAR SI ESTE MENSAJE YA FUE RESPONDIDO =====
-  const respondedTexts = await getRespondedMessages(participant);
-  if (respondedTexts.includes(messageText) && !isAdmin) {
-    // Ya respondimos este texto exacto antes. Podríamos no hacer nada o responder con una advertencia de repetición.
-    // Para no ser molesto, solo ignoramos silenciosamente.
-    console.log('Mensaje repetido detectado, ignorando.');
-    return;
-  }
-
-  // ===== SALUDOS CON COOLDOWN (solo si no es admin, admin saluda sin límite) =====
+  // ===== SALUDOS CON COOLDOWN (solo si no es admin) =====
   const trimmed = messageText.trim().toLowerCase();
-  const isGreeting = GREETINGS.some(g => {
-    return trimmed === g || trimmed.startsWith(g + ' ') || trimmed.startsWith(g + '!');
-  });
-  if (isGreeting && !isAdmin) {
+  // Detectar si es un saludo puro (sin otro contenido)
+  const isPureGreeting = GREETINGS.some(g => {
+    return trimmed === g || trimmed === g + '!' || trimmed === g + '?' || trimmed.startsWith(g + ' ');
+  }) && messageText.split(/\s+/).length <= 3; // máximo 3 palabras
+
+  if (isPureGreeting && !isAdmin) {
     const lastTime = lastGreetingTime[participant] || 0;
     const now = Date.now();
     if (now - lastTime > GREETING_COOLDOWN) {
       lastGreetingTime[participant] = now;
       const reply = `¡Hola ${pushName || ''}! 😄\nSoy Shiro Synthesis Two — ¿en qué te ayudo?`;
       await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
-      await addRespondedMessage(participant, messageText);
+      messageHistory.push({
+        id: `bot-${Date.now()}`,
+        participant: 'bot',
+        pushName: 'Shiro',
+        text: reply,
+        timestamp: Date.now(),
+        isBot: true
+      });
+      if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
+      await addRespondedMessage(participant, messageText, reply);
     }
     return;
   }
@@ -769,12 +863,19 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
   const askKeywords = ['qué', 'que', 'cómo', 'como', 'por qué', 'por que', 'ayuda', 'explica', 'explicar', 'cómo hago', 'cómo recargo', '?', 'dónde', 'donde', 'precio', 'cuánto', 'cuanto'];
   const looksLikeQuestion = messageText.includes('?') || askKeywords.some(k => plainLower.includes(k));
 
-  const isLongMessage = messageText.length > 100;
-  const spontaneousIntervention = !addressedToShiro && !looksLikeQuestion && isLongMessage && Math.random() < 0.1;
+  const isLongMessage = messageText.length > 150;
+  const spontaneousIntervention = !addressedToShiro && !looksLikeQuestion && isLongMessage && Math.random() < 0.05;
 
   const shouldUseAI = addressedToShiro || looksLikeQuestion || spontaneousIntervention;
 
   if (!shouldUseAI) return;
+
+  // Verificar si ya respondimos a este mensaje exacto antes (para evitar doble respuesta)
+  const responded = await getRespondedMessages(participant);
+  if (responded.some(r => r.message_text === messageText) && !isAdmin) {
+    console.log('Mensaje ya respondido anteriormente, ignorando.');
+    return;
+  }
 
   // ===== ENCOLAR RESPUESTA DE IA =====
   aiQueue.enqueue(async () => {
@@ -782,9 +883,10 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
     const userMemory = await loadUserMemory(participant) || {};
 
     // Construir mensajes para IA: incluir historial reciente + mensaje actual + datos de usuario
+    // Incluir tanto mensajes de usuario como respuestas del bot
     const historyMessages = messageHistory.slice(-MAX_HISTORY_MESSAGES).map(m => ({
-      role: 'user',
-      content: `${m.pushName}: ${m.text}`
+      role: m.isBot ? 'assistant' : 'user',
+      content: m.isBot ? `Shiro: ${m.text}` : `${m.pushName}: ${m.text}`
     }));
 
     // Añadir fecha/hora actual al prompt del sistema
@@ -837,15 +939,24 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
 
     await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
 
+    // Guardar respuesta del bot en historial
+    messageHistory.push({
+      id: `bot-${Date.now()}`,
+      participant: 'bot',
+      pushName: 'Shiro',
+      text: replyText,
+      timestamp: Date.now(),
+      isBot: true
+    });
+    if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
+
     // Registrar que este mensaje fue respondido
-    await addRespondedMessage(participant, messageText);
+    await addRespondedMessage(participant, messageText, replyText);
 
     // Intentar extraer información del usuario del mensaje actual (ej: juego favorito)
     const gameKeywords = ['juego', 'juegos', 'mobile legends', 'ml', 'honkai', 'genshin', 'steam', 'play', 'xbox', 'nintendo'];
     if (gameKeywords.some(k => plainLower.includes(k))) {
-      // Podríamos guardar que le gusta cierto juego; por simplicidad, guardamos la mención
       if (!userMemory.games) userMemory.games = [];
-      // Extraer nombre del juego (heurística básica)
       const words = messageText.split(/\s+/);
       for (let word of words) {
         if (gameKeywords.some(k => word.toLowerCase().includes(k))) {
@@ -892,7 +1003,7 @@ class SimpleQueue {
 }
 const aiQueue = new SimpleQueue();
 
-// Constantes para nudges (definidas después de la función para evitar hoisting)
+// Constantes para nudges
 const SILENCE_THRESHOLD = 1000 * 60 * 60; // 60 minutos
 const RESPONSE_WINDOW_AFTER_NUDGE = 1000 * 60 * 10; // 10 min
 const MIN_COOLDOWN = 1000 * 60 * 60 * 2; // 2h
