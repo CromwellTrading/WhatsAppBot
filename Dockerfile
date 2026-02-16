@@ -1,13 +1,13 @@
+# Dockerfile (producción)
 FROM node:20-bullseye-slim
 
 ENV NODE_ENV=production
 ENV PORT=3000
-# Mantenemos la optimización de memoria de Node
 ENV NODE_OPTIONS="--max-old-space-size=460"
 
 WORKDIR /usr/src/app
 
-# CORRECCIÓN: Agregamos 'git' y 'python3' (a veces necesario para compilaciones)
+# Dependencias básicas (git/python para builds nativas)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
@@ -16,11 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
  && rm -rf /var/lib/apt/lists/*
 
-COPY package.json ./
+# Copiamos package.json y package-lock.json (si existe) primero para cachear npm install
+COPY package.json package-lock.json* ./
 
-# Instalar dependencias
-RUN npm install --omit=dev --no-progress
+# Instalar dependencias (production)
+RUN npm install --omit=dev --no-progress --no-audit
 
+# Copiamos el resto del código
 COPY . .
 
 EXPOSE 3000
