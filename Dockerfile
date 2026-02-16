@@ -25,4 +25,4 @@ COPY . .
 
 EXPOSE 3000
 
-CMD ["node", "mod-bot-baileys-full.js"]
+CMD ["node", "sst-bot.js"]
