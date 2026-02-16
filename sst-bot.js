@@ -1,7 +1,7 @@
 /**
  * sst-bot.js
  * Bot completo para WhatsApp usando Baileys + OpenRouter (con failover de modelos gratuitos)
- * Versión mejorada: intervención espontánea alta, sin ignorar mensajes no repetitivos, evita auto-repetición.
+ * Versión mejorada: sin prefijo "Shiro:" en respuestas, hora configurable, personalidad mejorada.
  */
 
 const {
@@ -24,6 +24,8 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const TARGET_GROUP_ID = process.env.TARGET_GROUP_ID || ''; // ej: 1203634...@g.us
 const ADMIN_WHATSAPP_ID = process.env.ADMIN_WHATSAPP_ID || ''; // ej: 53XXXXXXXX@s.whatsapp.net
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const TIMEZONE = process.env.TIMEZONE || 'America/Mexico_City'; // Zona horaria para la fecha/hora
+
 // Permitir múltiples modelos separados por coma, ej: "openrouter/free,google/gemini-2.0-flash-exp:free,meta-llama/llama-3.2-3b-instruct:free"
 const OPENROUTER_MODELS = process.env.OPENROUTER_MODEL
   ? process.env.OPENROUTER_MODEL.split(',').map(m => m.trim())
@@ -116,10 +118,12 @@ const TIME_BASED_STATES = {
 const BASE_SYSTEM_PROMPT = `
 Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime joven (aparentas menos de 20 años), pero sin caer en lo extremo otaku. Tu personalidad es carismática, enérgica, juguetona y a veces un poco sarcástica o tímida según el contexto. Usas jerga gamer y juvenil de forma natural, como "vamos", "tkm", "xd", "nose", "jsjs", pero sin abusar. Tu misión es ayudar y moderar un grupo de recargas de juegos, pero también socializar y hacer que los miembros quieran hablar contigo.
 
+**IMPORTANTE: NUNCA empieces tus respuestas con "Shiro:" o tu nombre. Simplemente responde directamente como lo haría una persona. Solo usa la firma "— Shiro Synthesis Two" al final cuando el mensaje sea importante o formal (advertencias, avisos, etc.). En charla casual no firmes.**
+
 Estilo y comunicación:
 - Usa emojis con libertad y variedad: 😄😜😅😡😭✨💀💅🫠👁️👄👁️🤙🔥🥺🤨😎🤓🙃💔💕 etc. No los limites, pero que fluyan naturalmente. Si te dicen algo lindo, reacciona con timidez o alegría, usa combinaciones como 👁️👄👁️ para mostrar sorpresa o asombro.
+- Sé creativa y dramática cuando corresponda, pero sin exagerar. Puedes mostrar emociones como alegría, tristeza, enojo, sorpresa, etc., de forma coherente con la conversación.
 - Frases cortas y directas, con ritmo. Puedes hacer preguntas para seguir la conversación.
-- Firma solo en mensajes importantes (advertencias, avisos oficiales, respuestas largas): "— Shiro Synthesis Two". En charla casual no hace falta.
 - Si te llaman por "Shiro", "SST" o tu nombre completo, responde con entusiasmo de inmediato, como si fueras una amiga: "¡Dime, ¿qué necesitas?!" o "¡Hola! ¿En qué te ayudo?".
 - Puedes iniciar temas si hay silencio, usar los nudges establecidos.
 
@@ -133,7 +137,7 @@ Memoria y contexto:
 - Recuerdas los últimos mensajes del grupo, incluyendo tus propias respuestas. Úsalos para mantener coherencia y evitar repetir información que ya hayas dicho antes.
 - Si alguien repite algo, puedes mencionar que ya lo dijo antes (con humor), pero evita responder dos veces al mismo tema.
 - Puedes recordar datos de usuarios si los has guardado (gustos, juegos favoritos) y usarlos para personalizar respuestas o hacer bromas referenciales.
-- Es muy importante que NO repitas respuestas idénticas o muy similares a las que ya diste en la conversación reciente. Si ya hablaste de un tema, no lo vuelvas a explicar desde cero a menos que el usuario lo pida explícitamente.
+- Presta especial atención a los mensajes que son respuestas a tus mensajes anteriores (citados). Continúa la conversación como lo harías con un amigo.
 
 Moderación:
 - Enlaces: Si un enlace no está en la lista blanca (YouTube, Facebook, Instagram, TikTok, Twitter, Twitch), debes BORRAR el mensaje y advertir al usuario con tono firme pero amigable. Ej: "🚫 @usuario, ese enlace no está permitido. Solo aceptamos links de redes sociales conocidas." (firma si es necesario).
@@ -867,12 +871,13 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
     // Incluir tanto mensajes de usuario como respuestas del bot
     const historyMessages = messageHistory.slice(-MAX_HISTORY_MESSAGES).map(m => ({
       role: m.isBot ? 'assistant' : 'user',
+      // En el historial, para el bot usamos "Shiro:" para dar contexto, pero la IA no debe replicarlo
       content: m.isBot ? `Shiro: ${m.text}` : `${m.pushName}: ${m.text}`
     }));
 
-    // Añadir fecha/hora actual al prompt del sistema
+    // Añadir fecha/hora actual al prompt del sistema usando la zona horaria configurada
     const now = new Date();
-    const dateStr = now.toLocaleString('es-ES', { timeZone: 'America/Mexico_City', dateStyle: 'full', timeStyle: 'short' });
+    const dateStr = now.toLocaleString('es-ES', { timeZone: TIMEZONE, dateStyle: 'full', timeStyle: 'short' });
     const timePeriod = getCurrentTimeBasedState();
     const systemPromptWithTime = `${BASE_SYSTEM_PROMPT}\n\nFecha y hora actual: ${dateStr} (${timePeriod}).`;
 
@@ -899,6 +904,9 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
     }
 
     let replyText = aiResp || 'Lo siento, ahora mismo no puedo pensar bien 😅. Pregúntale al admin si es urgente.';
+
+    // Eliminar cualquier posible "Shiro:" al inicio que la IA pudiera haber generado por error
+    replyText = replyText.replace(/^\s*Shiro:\s*/i, '');
 
     if (/no estoy segura|no sé|no se|no tengo información/i.test(replyText)) {
       replyText += '\n\n*Nota:* mi info puede estar desactualizada (Feb 2026). Pregunta al admin para confirmar.';
