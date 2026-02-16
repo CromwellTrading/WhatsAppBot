@@ -1,19 +1,21 @@
 {
-  "name": "whatsapp-baileys-render-free",
+  "name": "shiro-synthesis-two-bot",
   "version": "1.0.0",
-  "description": "WhatsApp bot optimizado para Render Free",
-  "main": "mod-bot-baileys-full.js",
-  "engines": {
-    "node": ">=18"
-  },
+  "description": "Bot de WhatsApp Shiro Synthesis Two (SST) con OpenRouter",
+  "main": "sst-bot.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node mod-bot-baileys-full.js"
+    "start": "node sst-bot.js"
   },
+  "keywords": ["whatsapp","bot","openrouter","shiro","sst"],
+  "author": "Asche",
+  "license": "MIT",
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
-    "@supabase/supabase-js": "^2.39.7",
-    "express": "^4.19.2",
-    "pino": "^8.17.0",
-    "qrcode": "^1.5.4"
+    "@supabase/supabase-js": "^2.0.0",
+    "@whiskeysockets/baileys": "^6.6.0",
+    "axios": "^1.6.8",
+    "express": "^4.18.2",
+    "pino": "^8.15.0",
+    "qrcode": "^1.5.1"
   }
 }
