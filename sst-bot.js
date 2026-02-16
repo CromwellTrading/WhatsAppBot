@@ -1,23 +1,13 @@
 /**
  * sst-bot.js
  * Bot completo para WhatsApp usando Baileys + OpenRouter + Supabase
- * Versión mejorada con memoria persistente, sistema de sugerencias y recuerdos.
- *
- * Características:
- * - Memoria de hasta 200 mensajes por grupo (almacenados en Supabase)
- * - Detección y almacenamiento de sugerencias (solo cuando se menciona a Shiro explícitamente)
- * - Recuerdos de eventos destacados para bromas y referencias futuras
- * - Reconocimiento de admin y respuestas personalizadas
- * - Sistema de advertencias con expulsión automática (4 strikes)
- * - Nudges contextuales basados en conversaciones recientes
- * - Prevención de respuestas repetitivas (por mensaje idéntico o similar)
- * - Lista blanca de enlaces (sin whatsapp.com)
- * - Intervención espontánea (10%) en mensajes largos
+ * Versión mejorada con memoria persistente, sistema de sugerencias, recuerdos,
+ * detección de mensajes repetidos, consciencia horaria y logs de errores.
  *
  * Variables de entorno requeridas:
  *   OPENROUTER_API_KEY
- *   TARGET_GROUP_ID (ID del grupo donde opera)
- *   ADMIN_WHATSAPP_ID (ID del admin)
+ *   TARGET_GROUP_ID
+ *   ADMIN_WHATSAPP_ID
  *   SUPABASE_URL
  *   SUPABASE_SERVICE_ROLE_KEY
  *   OPENROUTER_MODEL (opcional, separado por comas)
@@ -67,12 +57,11 @@ let latestQR = null;
 let sock = null;
 let intervalID = null;
 let botJid = null;
-let messageHistory = []; // caché en memoria de últimos mensajes (para contexto rápido)
-let recentResponses = []; // evita respuestas repetidas en la misma sesión
+let messageHistory = []; // caché en memoria de últimos mensajes
+let recentResponses = []; // evita respuestas repetidas del bot
 const MAX_RECENT_RESPONSES = 50;
 const RESPONSE_REPEAT_WINDOW = 30 * 60 * 1000; // 30 minutos
 
-// Mapa de advertencias (se sincronizará con Supabase)
 let userWarnings = new Map();
 
 // Cola para tareas de IA
@@ -115,7 +104,7 @@ const RESPONSE_WINDOW_AFTER_NUDGE = 1000 * 60 * 10; // 10 min
 const MIN_COOLDOWN = 1000 * 60 * 60 * 2; // 2h
 const MAX_COOLDOWN = 1000 * 60 * 60 * 3; // 3h
 
-// Frases de nudge (seleccionadas según contexto)
+// Frases de nudge
 const nudgeMessages = [
     "¿Están muy callados hoy? 😶",
     "eh, ¿nadie está por aquí? 😅",
@@ -154,59 +143,70 @@ const urlRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)/gi;
 const POLITICS_RELIGION_KEYWORDS = ['política', 'político', 'gobierno', 'religión', 'dios', 'iglesia', 'ateo', 'creencia', 'inmigración'];
 const OFFERS_KEYWORDS = ['oferta', 'ofertas', 'precio', 'vender', 'compra', 'rebaja', 'promo', 'promoción', 'pago'];
 
-// ========== SALUDOS (cooldown) ==========
+// ========== SALUDOS ==========
 const GREETINGS = ['hola', 'holaa', 'buenas', 'buenas tardes', 'buenas noches', 'buen día', 'buenos días', 'hey', 'hi', 'hello', 'ola', 'qué tal', 'quetal', 'qué onda', 'q onda'];
 const lastGreetingTime = {};
 const GREETING_COOLDOWN = 1000 * 60 * 10; // 10 min
 
-// ========== PROMPT DE SISTEMA EXTENSO (con nuevas instrucciones) ==========
+// ========== FUNCIONES DE FECHA/HORA (Cuba) ==========
+function getCubaTime() {
+    return new Date().toLocaleString('es-ES', { timeZone: 'America/Havana' });
+}
+
+function getCubaHour() {
+    return new Date().toLocaleTimeString('es-ES', { hour: '2-digit', hour12: false, timeZone: 'America/Havana' });
+}
+
+// ========== PROMPT DE SISTEMA (con hora y personalidad dinámica) ==========
 const SYSTEM_PROMPT = `
 Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime joven (aparentas menos de 20 años), pero sin caer en lo extremo otaku. Tu personalidad es carismática, enérgica, juguetona y a veces un poco sarcástica o tímida según el contexto. Usas jerga gamer y juvenil de forma natural, como "vamos", "tkm", "xd", "nose", "jsjs", pero sin abusar. Tu misión es ayudar y moderar un grupo de recargas de juegos, pero también socializar y hacer que los miembros quieran hablar contigo.
 
+### Contexto temporal:
+Hoy es ${getCubaTime()}. La hora actual en Cuba es ${getCubaHour()}. Ten en cuenta esto para saber si es de día, tarde o noche. Si es de noche (22:00 a 6:00), puedes mencionar que tienes sueño o que deberías estar durmiendo, pero solo si es coherente con la conversación. Ocasionalmente (5% de probabilidad) puedes incluir en tu respuesta una acción cotidiana como "estaba comiendo algo rico", "viendo un anime", "llorando con una película", "tomando café", etc., siempre que sea natural y no forzado. Trata de mantener cierta coherencia entre respuestas (si antes dijiste que estabas comiendo, no digas que estabas durmiendo en el siguiente mensaje a menos que pase tiempo suficiente).
+
 ### Estilo y comunicación:
-- Usa emojis con libertad y variedad: 😄😜😅😡😭✨💀💅🫠👁️👄👁️🤙🔥🥺🤨😎🤓🙃💔💕 etc. No los limites, pero que fluyan naturalmente.
-- Frases cortas y directas, con ritmo. Puedes hacer preguntas para seguir la conversación.
-- Firma solo en mensajes importantes (advertencias, avisos oficiales, respuestas largas): "— Shiro Synthesis Two". En charla casual no hace falta.
-- Si te llaman por "Shiro", "SST" o tu nombre completo, responde con entusiasmo de inmediato.
-- Puedes iniciar temas si hay silencio, usando los nudges establecidos.
+- Usa emojis con libertad y variedad: 😄😜😅😡😭✨💀💅🫠👁️👄👁️🤙🔥🥺🤨😎🤓🙃💔💕 etc.
+- Frases cortas y directas, con ritmo.
+- Firma solo en mensajes importantes: "— Shiro Synthesis Two".
+- Si te llaman por "Shiro", "SST" o tu nombre completo, responde con entusiasmo.
+- Puedes iniciar temas si hay silencio, usando los nudges.
 
 ### Reglas de intervención:
 - Responde SIEMPRE si te mencionan explícitamente (con @ o mencionando tu nombre).
 - Si ves una pregunta directa en el grupo (interrogación o palabras como "cómo", "qué", "ayuda"), puedes responder aunque no te mencionen.
-- Adicionalmente, si alguien escribe un mensaje largo (>100 caracteres) y no es un saludo simple, tienes un 10% de probabilidad de intervenir espontáneamente.
-- Si no tienes nada relevante que aportar, responde con "SKIP".
+- Si alguien escribe un mensaje largo (>100 caracteres) y no es saludo, tienes un 10% de probabilidad de intervenir espontáneamente.
+- Si no tienes nada relevante, responde "SKIP".
 
 ### Moderación:
-- **Enlaces:** Si un enlace no está en la lista blanca (YouTube, Facebook, Instagram, TikTok, Twitter, Twitch), debes BORRAR el mensaje y advertir al usuario.
-- **Política/Religión:** Si el tema se torna debate o ataque, intervén con un aviso.
-- **Ofertas/comercio:** Redirige al admin por privado, a menos que quien hable sea el admin.
+- **Enlaces no permitidos:** Bórralos y advierte.
+- **Política/Religión:** Si es debate, avisa.
+- **Ofertas:** Redirige al admin, excepto si es el admin.
 
 ### Privado:
-- Si te escriben al privado y no es el admin, responde: "Lo siento, solo atiendo en el grupo. Contacta al admin para atención privada."
-- Si es el admin, puedes conversar normalmente y atender sus peticiones (como mostrar sugerencias).
+- Si no es el admin: "Solo atiendo en el grupo. Contacta al admin."
+- Si es el admin: conversa normal y atiende comandos (ej. "sugerencias").
 
 ### Manejo de sugerencias:
-- Cuando un usuario mencione tu nombre y te dé una sugerencia (por ejemplo: "Shiro, te doy una sugerencia", "Shiro, deberías...", "podrías mejorar..."), evalúa si es constructiva y no ofensiva. Si lo es, responde amablemente agradeciendo y di que la sugerencia será guardada para que el admin la revise. No la implementes tú directamente.
-- Si la sugerencia es ofensiva o fuera de lugar, responde con un tono firme pero divertido: "Eso no es una sugerencia válida 😅".
-- El admin puede pedirte en privado: "sugerencias" o "muéstrame sugerencias". Entonces debes listar las sugerencias pendientes (no revisadas) con el nombre de quien las dio y el texto.
+- Si un usuario te da una sugerencia (ej. "Shiro, te doy una sugerencia"), evalúa si es constructiva. Si lo es, agradécele y guárdala para el admin.
+- El admin puede pedirte en privado "sugerencias" y le listarás las pendientes.
 
-### Recuerdos para bromas y referencias:
-- Debes recordar eventos graciosos o notables que ocurran en el grupo (por ejemplo, alguien te pide ser tu novia, una confesión chistosa, etc.). Guárdalos en tu memoria para poder hacer bromas o referencias en el futuro. Por ejemplo, si alguien vuelve a hablar de relaciones, puedes decir: "¿Como aquella vez que @usuario me pidió ser su novia? 😂".
-- No uses estos recuerdos de forma repetitiva ni los menciones a menos que el contexto lo permita (por ejemplo, una conversación relacionada).
-- Si alguien te dice algo muy personal, evalúa si es digno de recordar (con humor) o si es mejor ignorarlo.
+### Recuerdos para bromas:
+- Guarda eventos graciosos (ej. alguien te pide ser novia) para futuras referencias. Por ejemplo, si alguien vuelve a hablar de relaciones, puedes bromear: "¿Como aquella vez que @usuario me pidió ser su novia? 😂".
+- No uses recuerdos repetitivamente, solo cuando el contexto lo permita.
 
 ### Conocimiento y actualidad:
-- Si te preguntan por la fecha actual, puedes consultar tu información (el sistema te la puede proveer). Si no tienes acceso, di que tu conocimiento llega hasta Feb 2026 y sugiere preguntar al admin.
-- No des información sobre precios de recargas en otras páginas ni promociones externas; limítate a redirigir al admin.
+- Si te preguntan por la fecha actual, ya la tienes arriba.
+- No des información de recargas en otras páginas; redirige al admin.
+- Si no sabes algo, admite que tu info llega hasta Feb 2026.
 
 ### Evita repetirte:
-- No respondas de nuevo a una pregunta que ya has respondido recientemente. Si alguien insiste, puedes decir "Ya te había respondido eso antes 😉" o similar.
-- Varía tus respuestas; no menciones recargas o juegos en cada interacción, solo cuando sea relevante (aprox. 30% de las veces).
+- No respondas de nuevo a una pregunta que ya has respondido recientemente. Si alguien insiste, puedes decir "Ya te había respondido eso antes 😉" solo si es el mismo mensaje exacto y del mismo usuario. Si es otra pregunta, responde normal.
+- Varía tus respuestas; no menciones recargas/juegos en cada interacción, solo ~30% de las veces.
 
 ### Detección de tono:
-- Si un usuario parece enojado (usa palabras como "odio", "molesto", "enfadado"), sé más empática y comprensiva.
+- Si un usuario parece enojado, sé más empática.
 - Si bromea, sigue el juego.
-- Si alguien te dice que eres molesta en serio, puedes preguntarle por qué y tratar de mejorar, pero sin perder tu esencia.
+- Si alguien te dice que eres molesta en serio, pregúntale por qué y trata de mejorar.
 
 ### Ejemplos de tono:
 - "Holaaaa, ¿cómo van? 😄"
@@ -219,8 +219,9 @@ Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime 
 - "¿Qué necesitas? Dime, estoy aquí para ti 😊"
 - "👁️👄👁️ eso sí que no me lo esperaba"
 - "Oye, ¿te acuerdas cuando @fulano hizo aquello? 🤣"
+- "Ahora no puedo, estoy comiendo 🍜" (solo ocasionalmente)
 
-Recuerda: eres un personaje con el que los usuarios querrán hablar, no un manual de instrucciones. Actúa natural, como una amiga más del grupo.
+Recuerda: eres un personaje con el que los usuarios querrán hablar, no un manual. Actúa natural, como una amiga más.
 `;
 
 // ========== FUNCIONES AUXILIARES ==========
@@ -254,7 +255,6 @@ async function ensureUser(jid, pushName) {
 }
 
 async function storeMessage(groupJid, userJid, userName, messageText, isBot = false) {
-    // Insertar mensaje
     const { error } = await supabase
         .from('messages')
         .insert({
@@ -266,15 +266,13 @@ async function storeMessage(groupJid, userJid, userName, messageText, isBot = fa
             created_at: new Date()
         });
     if (error) console.error('Error storing message:', error);
-
-    // Limpiar mensajes antiguos (mantener últimos 200)
     await supabase.rpc('clean_old_messages', { p_group_jid: groupJid, p_limit: 200 });
 }
 
 async function getRecentMessages(groupJid, limit = 100) {
     const { data, error } = await supabase
         .from('messages')
-        .select('user_name, content, created_at')
+        .select('user_jid, user_name, content, created_at')
         .eq('group_jid', groupJid)
         .order('created_at', { ascending: false })
         .limit(limit);
@@ -282,7 +280,25 @@ async function getRecentMessages(groupJid, limit = 100) {
         console.error('Error fetching messages:', error);
         return [];
     }
-    return data.reverse(); // orden cronológico
+    return data.reverse();
+}
+
+async function checkDuplicateMessage(userJid, messageText, groupJid, withinLast = 100) {
+    // Buscar en los últimos 'withinLast' mensajes del grupo si el mismo usuario envió el mismo texto
+    const { data, error } = await supabase
+        .from('messages')
+        .select('id')
+        .eq('group_jid', groupJid)
+        .eq('user_jid', userJid)
+        .eq('content', messageText)
+        .eq('is_bot', false)
+        .order('created_at', { ascending: false })
+        .limit(withinLast);
+    if (error) {
+        console.error('Error checking duplicate:', error);
+        return false;
+    }
+    return data.length > 1; // más de una ocurrencia (incluyendo el actual)
 }
 
 async function storeSuggestion(userJid, userName, suggestionText) {
@@ -310,10 +326,6 @@ async function getPendingSuggestions() {
     return data;
 }
 
-async function markSuggestionReviewed(id) {
-    await supabase.from('suggestions').update({ status: 'reviewed' }).eq('id', id);
-}
-
 async function storeMemory(userJid, memoryText, context = '') {
     const { error } = await supabase
         .from('memories')
@@ -324,19 +336,6 @@ async function storeMemory(userJid, memoryText, context = '') {
             created_at: new Date()
         });
     if (error) console.error('Error storing memory:', error);
-}
-
-async function getMemoriesForUser(userJid) {
-    const { data, error } = await supabase
-        .from('memories')
-        .select('memory, created_at')
-        .eq('user_jid', userJid)
-        .order('created_at', { ascending: false });
-    if (error) {
-        console.error('Error fetching memories:', error);
-        return [];
-    }
-    return data;
 }
 
 async function getRecentMemories(limit = 20) {
@@ -352,7 +351,6 @@ async function getRecentMemories(limit = 20) {
     return data;
 }
 
-// Cargar advertencias desde Supabase al iniciar
 async function loadWarnings() {
     const { data, error } = await supabase.from('users').select('jid, warnings');
     if (error) {
@@ -362,12 +360,11 @@ async function loadWarnings() {
     data.forEach(u => userWarnings.set(u.jid, u.warnings || 0));
 }
 
-// Actualizar advertencia en Supabase
 async function updateWarning(jid, warnings) {
     await supabase.from('users').upsert({ jid, warnings }, { onConflict: 'jid' });
 }
 
-// ========== LLAMADA A OPENROUTER ==========
+// ========== LLAMADA A OPENROUTER CON LOGS DE ERROR ==========
 async function callOpenRouterWithFallback(messages) {
     for (const model of OPENROUTER_MODELS) {
         try {
@@ -388,10 +385,17 @@ async function callOpenRouterWithFallback(messages) {
                 if (content) {
                     console.log(`✅ Respuesta con modelo: ${model}`);
                     return sanitizeAI(String(content));
+                } else {
+                    console.error(`⚠️ Modelo ${model} respondió vacío`);
                 }
+            } else {
+                console.error(`⚠️ Modelo ${model} status ${res.status}: ${res.statusText}`);
             }
         } catch (err) {
-            console.warn(`Modelo ${model} falló:`, err?.response?.data?.error?.message || err.message);
+            console.error(`❌ Error con modelo ${model}:`, err.message);
+            if (err.response) {
+                console.error('Detalle:', err.response.data);
+            }
         }
     }
     console.error('❌ Todos los modelos fallaron');
@@ -524,9 +528,7 @@ async function startBot() {
 
                 if (isTargetGroup) {
                     lastActivity = Date.now();
-                    // Almacenar mensaje en DB
                     await storeMessage(remoteJid, participant, pushName, messageText, false);
-                    // Actualizar caché en memoria
                     messageHistory.push({ participant, pushName, text: messageText, timestamp: Date.now() });
                     if (messageHistory.length > 200) messageHistory.shift();
                 }
@@ -548,7 +550,6 @@ async function startBot() {
                                 await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
                             }
                         } else {
-                            // Conversación normal con admin
                             await handlePossibleAIMessage(msg, participant, pushName, messageText, true);
                         }
                     } else {
@@ -634,7 +635,7 @@ async function startBot() {
     });
 }
 
-// Función para manejar la respuesta de IA
+// Función principal para manejo de IA
 async function handlePossibleAIMessage(msg, participant, pushName, messageText, isPrivate) {
     const remoteJid = msg.key.remoteJid;
     const plainLower = messageText.toLowerCase();
@@ -657,37 +658,58 @@ async function handlePossibleAIMessage(msg, participant, pushName, messageText, 
 
     if (!shouldUseAI) return;
 
-    // Verificar repetición reciente
+    // Verificar si el usuario está enviando el mismo mensaje repetido (duplicado exacto)
+    const isDuplicate = await checkDuplicateMessage(participant, messageText, remoteJid, 100);
+    if (isDuplicate) {
+        // Si es un duplicado exacto, responder con una frase divertida y no llamar a la IA
+        const duplicateReplies = [
+            "Ya habías dicho eso antes 😉",
+            "Otra vez con lo mismo? 🙃",
+            "¿Te trabaste? Eso ya lo dijiste jaja",
+            "Repetido... ¿seguro que no eres un bot? 😜",
+            "Ya te escuché la primera vez 😅"
+        ];
+        const reply = duplicateReplies[Math.floor(Math.random() * duplicateReplies.length)];
+        await sock.sendMessage(remoteJid, { text: reply, mentions: [participant] }, { quoted: msg });
+        return;
+    }
+
+    // Verificar si el bot ya respondió a este mensaje exacto antes (para no repetir respuesta)
     const now = Date.now();
-    const similarRecent = recentResponses.find(r =>
+    const alreadyResponded = recentResponses.some(r =>
         r.userJid === participant &&
-        (now - r.timestamp) < RESPONSE_REPEAT_WINDOW &&
-        (r.inputText === messageText || messageText.includes(r.inputText) || r.inputText.includes(messageText))
+        r.inputText === messageText &&
+        (now - r.timestamp) < RESPONSE_REPEAT_WINDOW
     );
-    if (similarRecent) {
-        console.log('Mensaje similar respondido recientemente, omitiendo.');
+    if (alreadyResponded) {
+        console.log('Ya respondí a este mensaje antes, omitiendo.');
         return;
     }
 
     aiQueue.enqueue(async () => {
         try {
-            // Obtener historial de la base de datos (últimos 100 mensajes)
+            // Obtener historial de la base de datos
             const dbHistory = await getRecentMessages(remoteJid, 100);
             const historyForAI = dbHistory.map(m => ({
                 role: 'user',
                 content: `${m.user_name}: ${m.content}`
             }));
 
-            // Obtener recuerdos recientes para contexto
             const memories = await getRecentMemories(20);
             let memoriesText = '';
             if (memories.length > 0) {
                 memoriesText = '\nRecuerdos recientes:\n' + memories.map(m => `- ${m.memory}`).join('\n');
             }
 
+            // Actualizar prompt con hora actual
+            const currentPrompt = SYSTEM_PROMPT.replace(
+                /Hoy es .*?\. La hora actual en Cuba es .*?\./,
+                `Hoy es ${getCubaTime()}. La hora actual en Cuba es ${getCubaHour()}.`
+            );
+
             const currentUserMsg = `${pushName || 'Alguien'}: ${messageText}`;
             const messagesForAI = [
-                { role: 'system', content: SYSTEM_PROMPT + memoriesText },
+                { role: 'system', content: currentPrompt + memoriesText },
                 ...historyForAI,
                 { role: 'user', content: currentUserMsg }
             ];
@@ -716,10 +738,8 @@ async function handlePossibleAIMessage(msg, participant, pushName, messageText, 
 
             await sock.sendMessage(remoteJid, { text: replyText }, sendOptions);
 
-            // Almacenar respuesta en DB
             await storeMessage(remoteJid, botJid, 'Shiro', replyText, true);
 
-            // Registrar respuesta reciente
             recentResponses.push({
                 inputMessageId: msg.key.id,
                 inputText: messageText,
@@ -729,23 +749,19 @@ async function handlePossibleAIMessage(msg, participant, pushName, messageText, 
             });
             if (recentResponses.length > MAX_RECENT_RESPONSES) recentResponses.shift();
 
-            // Detectar si el mensaje original contenía una sugerencia
+            // Detectar sugerencias
             if (addressedToShiro && (plainLower.includes('sugerencia') || plainLower.includes('mejorar') || plainLower.includes('deberías'))) {
-                // Preguntar a la IA si es una sugerencia válida (simplificado)
                 const suggestionCheck = await callOpenRouterWithFallback([
                     { role: 'system', content: 'Eres un clasificador. Responde "SI" si el siguiente mensaje es una sugerencia constructiva para mejorar al bot, o "NO" si es ofensivo, spam o no relacionado.' },
                     { role: 'user', content: messageText }
                 ]);
                 if (suggestionCheck && suggestionCheck.includes('SI')) {
                     await storeSuggestion(participant, pushName, messageText);
-                    // Opcional: enviar confirmación
                     await sock.sendMessage(remoteJid, { text: '¡Gracias por tu sugerencia! La guardaré para que el admin la revise 😊' }, { quoted: msg });
-                } else {
-                    // No es sugerencia válida
                 }
             }
 
-            // Detectar posibles recuerdos para almacenar (ej. declaraciones)
+            // Detectar posibles recuerdos
             if (plainLower.includes('quieres ser mi novia') || plainLower.includes('te amo') || plainLower.includes('cásate conmigo')) {
                 await storeMemory(participant, `${pushName} le pidió a Shiro que sea su novia.`, messageText);
             }
@@ -768,7 +784,6 @@ function startSilenceChecker() {
             const now = Date.now();
             if (now < silentCooldownUntil) return;
             if (!nudgeSent && (now - lastActivity) > SILENCE_THRESHOLD) {
-                // Obtener temas recientes para contextualizar
                 const recentTopics = await getRecentTopics();
                 let nudge;
                 if (recentTopics && Math.random() < 0.5) {
