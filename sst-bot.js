@@ -1,17 +1,8 @@
 /**
  * sst-bot.js
  * Bot completo para WhatsApp usando Baileys + OpenRouter + Supabase
- * Versión mejorada con memoria persistente, sistema de sugerencias, recuerdos,
- * detección de mensajes repetidos, consciencia horaria y logs de errores.
- *
- * Variables de entorno requeridas:
- *   OPENROUTER_API_KEY
- *   TARGET_GROUP_ID
- *   ADMIN_WHATSAPP_ID
- *   SUPABASE_URL
- *   SUPABASE_SERVICE_ROLE_KEY
- *   OPENROUTER_MODEL (opcional, separado por comas)
- *   PORT (opcional)
+ * Versión corregida: evita doble procesamiento, detección de duplicados mejorada,
+ * logs detallados y cola robusta.
  */
 
 const {
@@ -43,7 +34,7 @@ if (!OPENROUTER_API_KEY) {
     process.exit(1);
 }
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error('❌ ERROR: SUPABASE_URL y SUPABASE_KEY son necesarias para memoria persistente.');
+    console.error('❌ ERROR: SUPABASE_URL y SUPABASE_KEY son necesarias.');
     process.exit(1);
 }
 
@@ -57,12 +48,16 @@ let latestQR = null;
 let sock = null;
 let intervalID = null;
 let botJid = null;
-let messageHistory = []; // caché en memoria de últimos mensajes
+let messageHistory = []; // caché en memoria
 let recentResponses = []; // evita respuestas repetidas del bot
 const MAX_RECENT_RESPONSES = 50;
 const RESPONSE_REPEAT_WINDOW = 30 * 60 * 1000; // 30 minutos
 
 let userWarnings = new Map();
+
+// Set para evitar procesar el mismo mensaje dos veces (IDs recientes)
+const processedMessageIds = new Set();
+const PROCESSED_CLEANUP_INTERVAL = 10 * 60 * 1000; // 10 minutos
 
 // Cola para tareas de IA
 class SimpleQueue {
@@ -86,6 +81,7 @@ class SimpleQueue {
             next.res(result);
         } catch (e) {
             next.rej(e);
+            console.error('Error en tarea de cola:', e);
         } finally {
             this.running = false;
             setTimeout(() => this._runNext(), 250);
@@ -94,7 +90,7 @@ class SimpleQueue {
 }
 const aiQueue = new SimpleQueue();
 
-// ========== VARIABLES PARA SILENCIO / NUDGES ==========
+// ========== VARIABLES PARA SILENCIO ==========
 let lastActivity = Date.now();
 let lastNudgeTime = 0;
 let nudgeSent = false;
@@ -104,7 +100,6 @@ const RESPONSE_WINDOW_AFTER_NUDGE = 1000 * 60 * 10; // 10 min
 const MIN_COOLDOWN = 1000 * 60 * 60 * 2; // 2h
 const MAX_COOLDOWN = 1000 * 60 * 60 * 3; // 3h
 
-// Frases de nudge
 const nudgeMessages = [
     "¿Están muy callados hoy? 😶",
     "eh, ¿nadie está por aquí? 😅",
@@ -139,7 +134,7 @@ const ALLOWED_DOMAINS = [
 ];
 const urlRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)/gi;
 
-// ========== PALABRAS CLAVE PARA MODERACIÓN ==========
+// ========== PALABRAS CLAVE ==========
 const POLITICS_RELIGION_KEYWORDS = ['política', 'político', 'gobierno', 'religión', 'dios', 'iglesia', 'ateo', 'creencia', 'inmigración'];
 const OFFERS_KEYWORDS = ['oferta', 'ofertas', 'precio', 'vender', 'compra', 'rebaja', 'promo', 'promoción', 'pago'];
 
@@ -157,12 +152,12 @@ function getCubaHour() {
     return new Date().toLocaleTimeString('es-ES', { hour: '2-digit', hour12: false, timeZone: 'America/Havana' });
 }
 
-// ========== PROMPT DE SISTEMA (con hora y personalidad dinámica) ==========
+// ========== PROMPT DE SISTEMA ==========
 const SYSTEM_PROMPT = `
 Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime joven (aparentas menos de 20 años), pero sin caer en lo extremo otaku. Tu personalidad es carismática, enérgica, juguetona y a veces un poco sarcástica o tímida según el contexto. Usas jerga gamer y juvenil de forma natural, como "vamos", "tkm", "xd", "nose", "jsjs", pero sin abusar. Tu misión es ayudar y moderar un grupo de recargas de juegos, pero también socializar y hacer que los miembros quieran hablar contigo.
 
 ### Contexto temporal:
-Hoy es ${getCubaTime()}. La hora actual en Cuba es ${getCubaHour()}. Ten en cuenta esto para saber si es de día, tarde o noche. Si es de noche (22:00 a 6:00), puedes mencionar que tienes sueño o que deberías estar durmiendo, pero solo si es coherente con la conversación. Ocasionalmente (5% de probabilidad) puedes incluir en tu respuesta una acción cotidiana como "estaba comiendo algo rico", "viendo un anime", "llorando con una película", "tomando café", etc., siempre que sea natural y no forzado. Trata de mantener cierta coherencia entre respuestas (si antes dijiste que estabas comiendo, no digas que estabas durmiendo en el siguiente mensaje a menos que pase tiempo suficiente).
+Hoy es {{FECHA}}. La hora actual en Cuba es {{HORA}}. Ten en cuenta esto para saber si es de día, tarde o noche. Si es de noche (22:00 a 6:00), puedes mencionar que tienes sueño o que deberías estar durmiendo, pero solo si es coherente con la conversación. Ocasionalmente (5% de probabilidad) puedes incluir en tu respuesta una acción cotidiana como "estaba comiendo algo rico", "viendo un anime", "llorando con una película", "tomando café", etc., siempre que sea natural y no forzado. Trata de mantener cierta coherencia entre respuestas (si antes dijiste que estabas comiendo, no digas que estabas durmiendo en el siguiente mensaje a menos que pase tiempo suficiente).
 
 ### Estilo y comunicación:
 - Usa emojis con libertad y variedad: 😄😜😅😡😭✨💀💅🫠👁️👄👁️🤙🔥🥺🤨😎🤓🙃💔💕 etc.
@@ -200,7 +195,7 @@ Hoy es ${getCubaTime()}. La hora actual en Cuba es ${getCubaHour()}. Ten en cuen
 - Si no sabes algo, admite que tu info llega hasta Feb 2026.
 
 ### Evita repetirte:
-- No respondas de nuevo a una pregunta que ya has respondido recientemente. Si alguien insiste, puedes decir "Ya te había respondido eso antes 😉" solo si es el mismo mensaje exacto y del mismo usuario. Si es otra pregunta, responde normal.
+- No respondas de nuevo a una pregunta que ya has respondido recientemente. Si alguien insiste, puedes decir "Ya te había respondido eso antes 😉" solo si es el mismo mensaje exacto y del mismo usuario, y ha pasado poco tiempo. Si es otra pregunta, responde normal.
 - Varía tus respuestas; no menciones recargas/juegos en cada interacción, solo ~30% de las veces.
 
 ### Detección de tono:
@@ -243,6 +238,12 @@ function isAllowedDomain(url) {
     }
 }
 
+// Limpiar el set de mensajes procesados cada 10 minutos
+setInterval(() => {
+    processedMessageIds.clear();
+    console.log('🧹 Set de mensajes procesados limpiado.');
+}, PROCESSED_CLEANUP_INTERVAL);
+
 // ========== FUNCIONES DE BASE DE DATOS ==========
 async function ensureUser(jid, pushName) {
     const { data, error } = await supabase
@@ -283,8 +284,9 @@ async function getRecentMessages(groupJid, limit = 100) {
     return data.reverse();
 }
 
-async function checkDuplicateMessage(userJid, messageText, groupJid, withinLast = 100) {
-    // Buscar en los últimos 'withinLast' mensajes del grupo si el mismo usuario envió el mismo texto
+// Verifica si el mismo usuario ha enviado el mismo mensaje en los últimos 5 minutos (excluyendo el actual)
+async function checkDuplicateMessage(userJid, messageText, groupJid, currentMessageId) {
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     const { data, error } = await supabase
         .from('messages')
         .select('id')
@@ -292,13 +294,14 @@ async function checkDuplicateMessage(userJid, messageText, groupJid, withinLast 
         .eq('user_jid', userJid)
         .eq('content', messageText)
         .eq('is_bot', false)
-        .order('created_at', { ascending: false })
-        .limit(withinLast);
+        .gte('created_at', fiveMinutesAgo)
+        .limit(2); // con 2 basta para saber si hay al menos uno además del actual
     if (error) {
         console.error('Error checking duplicate:', error);
         return false;
     }
-    return data.length > 1; // más de una ocurrencia (incluyendo el actual)
+    // Si hay algún mensaje con id diferente al actual, es duplicado
+    return data.some(msg => msg.id !== currentMessageId);
 }
 
 async function storeSuggestion(userJid, userName, suggestionText) {
@@ -364,7 +367,7 @@ async function updateWarning(jid, warnings) {
     await supabase.from('users').upsert({ jid, warnings }, { onConflict: 'jid' });
 }
 
-// ========== LLAMADA A OPENROUTER CON LOGS DE ERROR ==========
+// ========== LLAMADA A OPENROUTER ==========
 async function callOpenRouterWithFallback(messages) {
     for (const model of OPENROUTER_MODELS) {
         try {
@@ -377,7 +380,7 @@ async function callOpenRouterWithFallback(messages) {
                     'HTTP-Referer': 'https://github.com/tuapp',
                     'X-Title': 'SST-Bot'
                 },
-                timeout: 30000
+                timeout: 60000 // 60 segundos
             });
             if (res.status === 200) {
                 const choice = res.data?.choices?.[0];
@@ -487,6 +490,7 @@ async function startBot() {
             console.log('✅ Conectado WhatsApp. SST activa.');
             latestQR = null;
             botJid = sock.user.id;
+            console.log('🤖 Bot JID:', botJid);
             startSilenceChecker();
         }
     });
@@ -513,6 +517,13 @@ async function startBot() {
             try {
                 if (!msg.message || msg.key.fromMe) continue;
 
+                // Evitar procesar el mismo mensaje dos veces
+                if (processedMessageIds.has(msg.key.id)) {
+                    console.log(`⏭️ Mensaje ${msg.key.id} ya procesado, ignorando.`);
+                    continue;
+                }
+                processedMessageIds.add(msg.key.id);
+
                 const remoteJid = msg.key.remoteJid;
                 const participant = msg.key.participant || remoteJid;
                 const pushName = msg.pushName || '';
@@ -526,6 +537,8 @@ async function startBot() {
                     '';
                 const plainLower = messageText.toLowerCase();
 
+                console.log(`📩 Mensaje de ${pushName} (${participant}) en ${remoteJid}: "${messageText}"`);
+
                 if (isTargetGroup) {
                     lastActivity = Date.now();
                     await storeMessage(remoteJid, participant, pushName, messageText, false);
@@ -536,7 +549,7 @@ async function startBot() {
                 // ========== MENSAJES PRIVADOS ==========
                 if (isPrivateChat) {
                     if (participant === ADMIN_WHATSAPP_ID) {
-                        // Comandos de admin
+                        console.log('👑 Mensaje privado del admin');
                         if (plainLower.includes('sugerencia') || plainLower.includes('sugerencias')) {
                             const suggestions = await getPendingSuggestions();
                             if (suggestions.length === 0) {
@@ -640,6 +653,8 @@ async function handlePossibleAIMessage(msg, participant, pushName, messageText, 
     const remoteJid = msg.key.remoteJid;
     const plainLower = messageText.toLowerCase();
 
+    console.log(`🤔 Evaluando mensaje para IA: "${messageText}"`);
+
     // Detectar mención
     let isMentioned = false;
     const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
@@ -656,12 +671,14 @@ async function handlePossibleAIMessage(msg, participant, pushName, messageText, 
 
     const shouldUseAI = isMentioned || addressedToShiro || looksLikeQuestion || spontaneousIntervention || isPrivate;
 
+    console.log(`📊 Decisión: isMentioned=${isMentioned}, addressedToShiro=${addressedToShiro}, looksLikeQuestion=${looksLikeQuestion}, spontaneous=${spontaneousIntervention}, isPrivate=${isPrivate} => shouldUseAI=${shouldUseAI}`);
+
     if (!shouldUseAI) return;
 
-    // Verificar si el usuario está enviando el mismo mensaje repetido (duplicado exacto)
-    const isDuplicate = await checkDuplicateMessage(participant, messageText, remoteJid, 100);
+    // Verificar si el usuario está enviando el mismo mensaje repetido (duplicado exacto en los últimos 5 minutos)
+    const isDuplicate = await checkDuplicateMessage(participant, messageText, remoteJid, msg.key.id);
     if (isDuplicate) {
-        // Si es un duplicado exacto, responder con una frase divertida y no llamar a la IA
+        console.log('⚠️ Mensaje duplicado detectado, respondiendo con frase de repetición.');
         const duplicateReplies = [
             "Ya habías dicho eso antes 😉",
             "Otra vez con lo mismo? 🙃",
@@ -682,10 +699,11 @@ async function handlePossibleAIMessage(msg, participant, pushName, messageText, 
         (now - r.timestamp) < RESPONSE_REPEAT_WINDOW
     );
     if (alreadyResponded) {
-        console.log('Ya respondí a este mensaje antes, omitiendo.');
+        console.log('⏭️ Ya respondí a este mensaje antes, omitiendo.');
         return;
     }
 
+    console.log('📤 Encolando tarea de IA...');
     aiQueue.enqueue(async () => {
         try {
             // Obtener historial de la base de datos
@@ -702,10 +720,9 @@ async function handlePossibleAIMessage(msg, participant, pushName, messageText, 
             }
 
             // Actualizar prompt con hora actual
-            const currentPrompt = SYSTEM_PROMPT.replace(
-                /Hoy es .*?\. La hora actual en Cuba es .*?\./,
-                `Hoy es ${getCubaTime()}. La hora actual en Cuba es ${getCubaHour()}.`
-            );
+            const currentPrompt = SYSTEM_PROMPT
+                .replace('{{FECHA}}', getCubaTime())
+                .replace('{{HORA}}', getCubaHour());
 
             const currentUserMsg = `${pushName || 'Alguien'}: ${messageText}`;
             const messagesForAI = [
@@ -716,7 +733,7 @@ async function handlePossibleAIMessage(msg, participant, pushName, messageText, 
 
             const aiResp = await callOpenRouterWithFallback(messagesForAI);
             if (!aiResp || aiResp.trim().toUpperCase() === 'SKIP') {
-                console.log('IA decidió no responder');
+                console.log('ℹ️ IA decidió no responder (SKIP)');
                 return;
             }
 
@@ -737,6 +754,7 @@ async function handlePossibleAIMessage(msg, participant, pushName, messageText, 
             }
 
             await sock.sendMessage(remoteJid, { text: replyText }, sendOptions);
+            console.log(`✅ Respuesta enviada a ${pushName}: "${replyText.substring(0, 50)}..."`);
 
             await storeMessage(remoteJid, botJid, 'Shiro', replyText, true);
 
@@ -766,12 +784,12 @@ async function handlePossibleAIMessage(msg, participant, pushName, messageText, 
                 await storeMemory(participant, `${pushName} le pidió a Shiro que sea su novia.`, messageText);
             }
         } catch (e) {
-            console.error('Error en tarea de IA', e);
+            console.error('❌ Error en tarea de IA', e);
         }
-    }).catch(e => console.error('Error al encolar tarea IA', e));
+    }).catch(e => console.error('❌ Error al encolar tarea IA', e));
 }
 
-// ========== CHECKER DE SILENCIO (NUDGES) ==========
+// ========== CHECKER DE SILENCIO ==========
 async function getRecentTopics() {
     const messages = await getRecentMessages(TARGET_GROUP_ID, 10);
     const topics = messages.map(m => m.content).join(' ').substring(0, 200);
