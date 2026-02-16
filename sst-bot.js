@@ -623,3 +623,4 @@ process.on('unhandledRejection', (reason) => { console.error('Unhandled Rejectio
 
 // ========== INICIO ==========
 startBot().catch(e => console.error('Error fatal al iniciar bot', e));
+
