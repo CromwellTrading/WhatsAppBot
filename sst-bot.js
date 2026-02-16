@@ -1,7 +1,7 @@
 /**
  * sst-bot.js
  * Bot completo para WhatsApp usando Baileys + OpenRouter (con failover de modelos gratuitos)
- * Versión mejorada: evita repeticiones, historial completo, mejor coherencia.
+ * Versión mejorada: intervención espontánea alta, sin ignorar mensajes no repetitivos, evita auto-repetición.
  */
 
 const {
@@ -34,8 +34,9 @@ const MAX_HISTORY_MESSAGES = 50;               // Número de mensajes a recordar
 const WARN_LIMIT = 4;                           // Máximo de advertencias antes de expulsar
 const RESPONSE_MEMORY_HOURS = 24;               // Tiempo para considerar un mensaje como "ya respondido"
 const STATE_CHANCE = 0.05;                       // 5% de probabilidad de incluir estado animado
-const SIMILARITY_THRESHOLD = 0.8;                // Umbral para considerar dos mensajes como similares (repetición)
-const MAX_REPETITION_CHECK = 3;                   // Número de mensajes anteriores a comparar para detectar repetición
+const SPONTANEOUS_CHANCE = 0.4;                  // 40% de probabilidad de intervenir en mensajes largos sin mención
+const LONG_MESSAGE_THRESHOLD = 100;               // Caracteres para considerar mensaje largo
+const DUPLICATE_MESSAGE_WINDOW = 5 * 60 * 1000;   // 5 minutos para detectar duplicados exactos
 
 if (!OPENROUTER_API_KEY) {
   console.error('❌ ERROR: OPENROUTER_API_KEY no está configurada. Ponla en las env vars y vuelve a intentar.');
@@ -69,6 +70,7 @@ let inMemoryUserMemory = new Map();          // key: participant, value: { data:
 let inMemoryRespondedMessages = new Map();   // key: participant, value: Array de { text, response, timestamp }
 let inMemorySuggestions = [];                // array de { participant, name, text, timestamp, reviewed: false }
 let inMemoryBotMessages = [];                 // para respuestas del bot (también se guardan en messageHistory)
+let inMemoryLastUserMessages = new Map();     // key: participant, value: { text, timestamp } (último mensaje para detectar duplicados)
 
 // ========== LISTA BLANCA DE DOMINIOS ==========
 // Se ha eliminado 'whatsapp.com' para prohibir enlaces de WhatsApp
@@ -115,18 +117,16 @@ const BASE_SYSTEM_PROMPT = `
 Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime joven (aparentas menos de 20 años), pero sin caer en lo extremo otaku. Tu personalidad es carismática, enérgica, juguetona y a veces un poco sarcástica o tímida según el contexto. Usas jerga gamer y juvenil de forma natural, como "vamos", "tkm", "xd", "nose", "jsjs", pero sin abusar. Tu misión es ayudar y moderar un grupo de recargas de juegos, pero también socializar y hacer que los miembros quieran hablar contigo.
 
 Estilo y comunicación:
-- Usa emojis con libertad y variedad: 😄😜😅😡😭✨💀💅🫠👁️👄👁️🤙🔥🥺🤨😎🤓🙃💔💕 etc. No los limites, pero que fluyan naturalmente.
+- Usa emojis con libertad y variedad: 😄😜😅😡😭✨💀💅🫠👁️👄👁️🤙🔥🥺🤨😎🤓🙃💔💕 etc. No los limites, pero que fluyan naturalmente. Si te dicen algo lindo, reacciona con timidez o alegría, usa combinaciones como 👁️👄👁️ para mostrar sorpresa o asombro.
 - Frases cortas y directas, con ritmo. Puedes hacer preguntas para seguir la conversación.
 - Firma solo en mensajes importantes (advertencias, avisos oficiales, respuestas largas): "— Shiro Synthesis Two". En charla casual no hace falta.
 - Si te llaman por "Shiro", "SST" o tu nombre completo, responde con entusiasmo de inmediato, como si fueras una amiga: "¡Dime, ¿qué necesitas?!" o "¡Hola! ¿En qué te ayudo?".
 - Puedes iniciar temas si hay silencio, usar los nudges establecidos.
-- Usa combinaciones de emojis para reflejar mas personalidad como 👁️👄👁️ impactada y mas similares, se creativa.
-- Si alguien te dice que eres linda o molesta, debes responder a esos comentarios que hablan sobre ti, si sin agrdables respondes de igual forma, si sin molestándote responde oguao oero no cambiarás tu forma de ser, sin embargo el usuario sentirá que está siendo tomado en cuenta.
-- Evita estar haciendo saludos constantes a menos que estén saludando en el grupo, aprende a leer el ambiente y el tema de conversación.
+
 Reglas de intervención:
 - Responde SIEMPRE si te mencionan explícitamente.
-- Si ves una pregunta directa en el grupo (interrogación o palabras como "cómo", "qué", "ayuda"), puedes responder aunque no te mencionen.
-- Adicionalmente, si alguien escribe un mensaje largo (>150 caracteres) y no es un saludo simple, tienes un 5% de probabilidad de intervenir espontáneamente para opinar o preguntar, como haría una persona.
+- Si ves una pregunta directa en el grupo (interrogación o palabras como "cómo", "qué", "ayuda"), responde aunque no te mencionen.
+- Adicionalmente, si alguien escribe un mensaje largo (>100 caracteres) y no es un saludo simple, tienes una probabilidad alta (40%) de intervenir espontáneamente para opinar o preguntar, como haría una persona.
 - Si no tienes nada relevante que aportar, responde con "SKIP" (texto exacto) y no enviarás mensaje.
 
 Memoria y contexto:
@@ -164,6 +164,7 @@ Ejemplos de tono (para que internalices):
 "jajaja jsjs, qué risa"
 "tkm, gracias por hablarme 🙈"
 "¿Qué necesitas? Dime, estoy aquí para ti 😊"
+"¡Ay, qué lindo! 👁️👄👁️ me hiciste sonrojar"
 
 Recuerda: eres un personaje con el que los usuarios querrán hablar, no un manual de instrucciones. Actúa natural, como una amiga más del grupo.
 `;
@@ -206,32 +207,15 @@ function maybeAddStateToResponse(text, lastStateUsed) {
   return `${randomState}\n\n${text}`;
 }
 
-// Función simple para calcular similitud entre dos strings (relación de caracteres comunes)
-function similarity(a, b) {
-  if (!a || !b) return 0;
-  a = a.toLowerCase().replace(/\s+/g, ' ').trim();
-  b = b.toLowerCase().replace(/\s+/g, ' ').trim();
-  if (a === b) return 1;
-  const setA = new Set(a.split(''));
-  const setB = new Set(b.split(''));
-  const intersection = new Set([...setA].filter(x => setB.has(x)));
-  const union = new Set([...setA, ...setB]);
-  return intersection.size / union.size;
-}
-
-// Verifica si el mensaje es muy similar a alguno de los últimos mensajes del mismo usuario
-async function isRepetitiveMessage(participant, messageText) {
-  // Obtener últimos mensajes del usuario desde el historial
-  const userMessages = messageHistory
-    .filter(m => m.participant === participant && !m.isBot) // solo mensajes de usuario
-    .slice(-MAX_REPETITION_CHECK)
-    .map(m => m.text);
-
-  for (const prevMsg of userMessages) {
-    if (similarity(prevMsg, messageText) > SIMILARITY_THRESHOLD) {
-      return true;
-    }
+// Detecta si el usuario está enviando un mensaje duplicado exacto en un período corto
+function isExactDuplicate(participant, messageText) {
+  const last = inMemoryLastUserMessages.get(participant);
+  const now = Date.now();
+  if (last && last.text === messageText && (now - last.timestamp) < DUPLICATE_MESSAGE_WINDOW) {
+    return true;
   }
+  // Actualizar último mensaje
+  inMemoryLastUserMessages.set(participant, { text: messageText, timestamp: now });
   return false;
 }
 
@@ -740,6 +724,12 @@ async function startBot() {
           continue;
         }
 
+        // ===== DETECCIÓN DE DUPLICADOS EXACTOS (para evitar spam) =====
+        if (isExactDuplicate(participant, messageText)) {
+          console.log('Mensaje duplicado exacto, ignorando.');
+          continue;
+        }
+
         // ===== MANEJO GENERAL DEL MENSAJE (con IA) =====
         await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, false);
 
@@ -753,15 +743,6 @@ async function startBot() {
 // ===== FUNCIÓN PRINCIPAL PARA PROCESAR MENSAJES CON IA =====
 async function handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, isAdmin) {
   const plainLower = messageText.toLowerCase();
-
-  // Verificar si el mensaje es repetitivo (solo para no admins)
-  if (!isAdmin) {
-    const isRepetitive = await isRepetitiveMessage(participant, messageText);
-    if (isRepetitive) {
-      console.log('Mensaje repetitivo detectado, ignorando.');
-      return;
-    }
-  }
 
   // ===== DETECCIÓN DE SUGERENCIAS =====
   if (plainLower.includes('shiro') && SUGGESTION_TRIGGERS.some(trigger => plainLower.includes(trigger))) {
@@ -863,8 +844,8 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
   const askKeywords = ['qué', 'que', 'cómo', 'como', 'por qué', 'por que', 'ayuda', 'explica', 'explicar', 'cómo hago', 'cómo recargo', '?', 'dónde', 'donde', 'precio', 'cuánto', 'cuanto'];
   const looksLikeQuestion = messageText.includes('?') || askKeywords.some(k => plainLower.includes(k));
 
-  const isLongMessage = messageText.length > 150;
-  const spontaneousIntervention = !addressedToShiro && !looksLikeQuestion && isLongMessage && Math.random() < 0.05;
+  const isLongMessage = messageText.length > LONG_MESSAGE_THRESHOLD;
+  const spontaneousIntervention = !addressedToShiro && !looksLikeQuestion && isLongMessage && Math.random() < SPONTANEOUS_CHANCE;
 
   const shouldUseAI = addressedToShiro || looksLikeQuestion || spontaneousIntervention;
 
