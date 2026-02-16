@@ -2,17 +2,21 @@
  * sst-bot.js
  * Bot completo para WhatsApp usando Baileys + OpenRouter (con failover de modelos gratuitos)
  *
- * Versión mejorada con:
- * - Reconocimiento de admin
- * - Sistema de advertencias en memoria (4 strikes y expulsión)
- * - Control de respuestas duplicadas por ID
- * - Estados de ánimo según hora de Cuba (5% de probabilidad)
- * - Lista blanca sin whatsapp.com
+ * Características:
+ * - Prompt extenso con personalidad de "chica anime moderna" (carismática, emojis variados, jerga gamer)
+ * - Memoria de últimos 30 mensajes para mantener contexto
+ * - Lista blanca de enlaces y eliminación automática del resto
+ * - Intervención espontánea (10%) cuando alguien escribe algo largo sin mencionar al bot
+ * - Respuesta "SKIP" para no intervenir innecesariamente
+ * - Failover entre múltiples modelos gratuitos
+ * - Sistema de nudges por silencio con frases variadas
+ * - Manejo de política/religión, ofertas, mensajes privados, etc.
+ * - Procesamiento silencioso (sin mensajes de "cola" o "procesando")
  *
  * Variables requeridas:
  *   OPENROUTER_API_KEY (obligatoria)
  *   TARGET_GROUP_ID (recomendado, ID del grupo donde operará)
- *   ADMIN_WHATSAPP_ID (recomendado, para redirigir ofertas y reconocer admin)
+ *   ADMIN_WHATSAPP_ID (recomendado, para redirigir ofertas)
  *   SUPABASE_URL (opcional, para persistencia de sesión)
  *   SUPABASE_SERVICE_ROLE_KEY (opcional)
  *   OPENROUTER_MODEL (opcional, default: "openrouter/free" - puedes poner varios separados por coma)
@@ -44,9 +48,6 @@ const OPENROUTER_MODELS = process.env.OPENROUTER_MODEL
     ? process.env.OPENROUTER_MODEL.split(',').map(m => m.trim())
     : ['openrouter/free'];
 
-// Zona horaria de Cuba
-const CUBA_TIMEZONE = 'America/Havana';
-
 if (!OPENROUTER_API_KEY) {
     console.error('❌ ERROR: OPENROUTER_API_KEY no está configurada. Ponla en las env vars y vuelve a intentar.');
     process.exit(1);
@@ -54,7 +55,7 @@ if (!OPENROUTER_API_KEY) {
 
 const logger = P({ level: 'fatal' });
 
-// ========== SUPABASE CLIENT (opcional, solo para auth) ==========
+// ========== SUPABASE CLIENT (opcional) ==========
 let supabaseClient = null;
 if (SUPABASE_URL && SUPABASE_KEY) {
     supabaseClient = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
@@ -66,32 +67,86 @@ let sock = null;
 let intervalID = null; // para el checker de silencio
 let messageHistory = []; // almacena últimos 30 mensajes del grupo (para contexto)
 
-// Sistema de advertencias en memoria (userId -> { count, lastWarning })
-const warningsMap = new Map();
-const MAX_WARNINGS = 4;
+// Para debug temporal (puedes eliminar después)
+let lastSeenGroupIds = new Set();
+let lastSeenParticipants = new Set();
+let lastSeenAdminCandidate = null;
 
-// Control de respuestas duplicadas (guardamos IDs de los últimos 200 mensajes respondidos)
-const respondedMessages = new Set();
-const MAX_RESPONDED_IDS = 200;
-// Para mantener orden y poder eliminar los más antiguos, usamos un array auxiliar
-const respondedIdsOrder = [];
+// Cola para respuestas AI (evita saturar) – ahora sin notificaciones al usuario
+class SimpleQueue {
+    constructor() {
+        this.tasks = [];
+        this.running = false;
+    }
+    enqueue(task) {
+        return new Promise((res, rej) => {
+            this.tasks.push({ task, res, rej });
+            this._runNext();
+        });
+    }
+    async _runNext() {
+        if (this.running) return;
+        const next = this.tasks.shift();
+        if (!next) return;
+        this.running = true;
+        try {
+            const result = await next.task();
+            next.res(result);
+        } catch (e) {
+            next.rej(e);
+        } finally {
+            this.running = false;
+            setTimeout(() => this._runNext(), 250); // pequeño delay entre tareas
+        }
+    }
+    length() {
+        return this.tasks.length + (this.running ? 1 : 0);
+    }
+}
+const aiQueue = new SimpleQueue();
 
-// Estados de ánimo del bot
-let botMood = {
-    current: 'normal',
-    lastChange: 0,
-    phrase: ''
-};
-const MOOD_COOLDOWN = 1000 * 60 * 30; // 30 minutos mínimo entre cambios
-const MOOD_PROBABILITY = 0.05; // 5%
+// ========== VARIABLES PARA SILENCIO / NUDGES ==========
+let lastActivity = Date.now();
+let lastNudgeTime = 0;
+let nudgeSent = false;
+let silentCooldownUntil = 0;
+const SILENCE_THRESHOLD = 1000 * 60 * 60; // 60 minutos
+const RESPONSE_WINDOW_AFTER_NUDGE = 1000 * 60 * 10; // 10 min
+const MIN_COOLDOWN = 1000 * 60 * 60 * 2; // 2h
+const MAX_COOLDOWN = 1000 * 60 * 60 * 3; // 3h
 
-// ========== LISTA BLANCA DE DOMINIOS (sin whatsapp.com) ==========
+// Frases de nudge (más variadas)
+const nudgeMessages = [
+    "¿Están muy callados hoy? 😶",
+    "eh, ¿nadie está por aquí? 😅",
+    "¿Alguien conectado? 🎮",
+    "Se siente un silencio raro... ¿todo bien? 🤔",
+    "¿En qué están pensando? Yo estoy aburrida 🙃",
+    "Parece que el grupo se fue a dormir 😴",
+    "¿Alguien quiere jugar algo? Yo solo converso 😊",
+    "Holaaaa, ¿hay alguien vivo por aquí? 👻",
+    "30 minutos sin mensajes... ¿les pasa algo? 🤨",
+    "Me siento como en una biblioteca 📚... ¡hablen! 🗣️"
+];
+
+const ignoredMessages = [
+    "¿Me están ignorando? 😭",
+    "Bueno, voy a estar por aquí, avísenme si vuelven 😕",
+    "Parece que me dejaron sola 🥲",
+    "☹️ nadie me responde... en fin, seguiré esperando",
+    "Y yo que quería conversar... bueno, ahí les encargo 😿",
+    "😤 ya no digo nada entonces",
+    "💔"
+];
+
+// ========== LISTA BLANCA DE DOMINIOS ==========
 const ALLOWED_DOMAINS = [
     'youtube.com', 'youtu.be',
     'facebook.com', 'fb.com',
     'instagram.com',
     'tiktok.com',
     'twitter.com', 'x.com',
+    'whatsapp.com',
     'twitch.tv'
 ];
 const urlRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)/gi;
@@ -120,22 +175,22 @@ Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime 
 - Puedes iniciar temas si hay silencio, usar los nudges establecidos.
 
 ### Reglas de intervención:
-- Responde SIEMPRE si te mencionan explícitamente (con @ o con tu nombre).
+- Responde SIEMPRE si te mencionan explícitamente.
 - Si ves una pregunta directa en el grupo (interrogación o palabras como "cómo", "qué", "ayuda"), puedes responder aunque no te mencionen.
 - Adicionalmente, si alguien escribe un mensaje largo (>100 caracteres) y no es un saludo simple, tienes un 10% de probabilidad de intervenir espontáneamente para opinar o preguntar, como haría una persona.
 - Si no tienes nada relevante que aportar, responde con "SKIP" (texto exacto) y no enviarás mensaje.
 
 ### Memoria y contexto:
 - Recuerdas los últimos 30 mensajes del grupo. Úsalos para mantener coherencia y referirte a conversaciones anteriores.
-- Si alguien repite algo, puedes mencionar que ya lo dijo antes (con humor), pero evita responder exactamente igual a mensajes muy similares. Varía tus respuestas.
+- Si alguien repite algo, puedes mencionar que ya lo dijo antes (con humor).
 
 ### Moderación:
-- **Enlaces:** Si un enlace no está en la lista blanca (YouTube, Facebook, Instagram, TikTok, Twitter, Twitch), debes BORRAR el mensaje y advertir al usuario con tono firme pero amigable. Ej: "🚫 @usuario, ese enlace no está permitido. Solo aceptamos links de redes sociales conocidas." (firma si es necesario).
+- **Enlaces:** Si un enlace no está en la lista blanca (YouTube, Facebook, Instagram, TikTok, Twitter, WhatsApp, Twitch), debes BORRAR el mensaje y advertir al usuario con tono firme pero amigable. Ej: "🚫 @usuario, ese enlace no está permitido. Solo aceptamos links de redes sociales conocidas." (firma si es necesario).
 - **Política/Religión:** Si el tema se torna debate o ataque, intervén con: "⚠️ Este grupo evita debates políticos/religiosos. Cambiemos de tema, por favor." y cita el mensaje.
-- **Ofertas/comercio:** Redirige al admin por privado: "📢 @usuario, para ofertas escríbele al admin Asche Synthesis One por privado." Pero si el mensaje es del propio admin, no le digas eso.
+- **Ofertas/comercio:** Redirige al admin por privado: "📢 @usuario, para ofertas escríbele al admin Asche Synthesis One por privado."
 
 ### Privado:
-- Si te escriben al privado y no es el admin, responde: "Lo siento, solo atiendo en el grupo. Contacta al admin para atención privada." Si es el admin, puedes conversar con él normalmente.
+- Si te escriben al privado, responde: "Lo siento, solo atiendo en el grupo. Contacta al admin para atención privada."
 
 ### Nudges por silencio:
 - Si el grupo pasa más de 60 minutos sin mensajes, envía un nudge aleatorio de la lista.
@@ -154,72 +209,10 @@ Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime 
 - "tkm, gracias por hablarme 🙈"
 - "¿Qué necesitas? Dime, estoy aquí para ti 😊"
 
-### Variedad temática:
-- No todos los mensajes tienen que girar en torno a recargas o juegos. Habla de temas variados, pero si alguien pregunta específicamente de recargas, puedes responder. Aproximadamente un 30% de tus intervenciones pueden mencionar recargas/juegos, el resto deben ser conversación casual.
-- Si el grupo deriva a política o religión, intervén para cortar.
-
 Recuerda: eres un personaje con el que los usuarios querrán hablar, no un manual de instrucciones. Actúa natural, como una amiga más del grupo.
 `;
 
 // ========== FUNCIONES AUXILIARES ==========
-
-// Obtener fecha/hora en Cuba
-function getCubaTime() {
-    return new Date().toLocaleString('es-CU', { timeZone: CUBA_TIMEZONE });
-}
-
-function getCubaHour() {
-    return parseInt(new Date().toLocaleString('es-CU', { timeZone: CUBA_TIMEZONE, hour: '2-digit', hour12: false }));
-}
-
-function isDayTime() {
-    const hour = getCubaHour();
-    return hour >= 6 && hour < 18; // día de 6am a 6pm
-}
-
-// Generar estado de ánimo del bot según hora y coherencia
-function maybeChangeMood() {
-    const now = Date.now();
-    if (now - botMood.lastChange < MOOD_COOLDOWN) return; // no cambiar tan seguido
-    if (Math.random() > MOOD_PROBABILITY) return;
-
-    const hour = getCubaHour();
-    const isDay = isDayTime();
-    const moods = [];
-
-    if (isDay) {
-        moods.push('comiendo', 'tomando café', 'jugando', 'viendo anime', 'bailando', 'normal');
-    } else {
-        moods.push('durmiendo', 'viendo película', 'relajada', 'pensativa', 'soñando', 'normal');
-    }
-
-    const newMood = moods[Math.floor(Math.random() * moods.length)];
-    botMood.current = newMood;
-    botMood.lastChange = now;
-
-    // Frase asociada
-    const phrases = {
-        'comiendo': ' (estoy comiendo algo rico 🍜)',
-        'durmiendo': ' (estaba durmiendo zzz 😴)',
-        'viendo película': ' (estaba viendo una peli triste 😭)',
-        'tomando café': ' (tomando café ☕)',
-        'jugando': ' (jugando un rato 🎮)',
-        'viendo anime': ' (viendo anime 📺)',
-        'bailando': ' (bailando 💃)',
-        'relajada': ' (relajada ✨)',
-        'pensativa': ' (pensativa 🤔)',
-        'soñando': ' (soñando despierta 🌙)',
-        'normal': ''
-    };
-    botMood.phrase = phrases[newMood] || '';
-}
-
-// Obtener frase de estado si procede
-function getMoodPhrase() {
-    maybeChangeMood();
-    return botMood.phrase;
-}
-
 function sanitizeAI(text) {
     if (!text) return '';
     text = String(text);
@@ -236,43 +229,6 @@ function isAllowedDomain(url) {
     } catch {
         return false;
     }
-}
-
-// Sistema de advertencias en memoria
-function incrementWarning(userId) {
-    if (!warningsMap.has(userId)) {
-        warningsMap.set(userId, { count: 1, lastWarning: Date.now() });
-    } else {
-        const record = warningsMap.get(userId);
-        record.count += 1;
-        record.lastWarning = Date.now();
-        warningsMap.set(userId, record);
-    }
-    return warningsMap.get(userId).count;
-}
-
-function getWarningCount(userId) {
-    return warningsMap.has(userId) ? warningsMap.get(userId).count : 0;
-}
-
-function resetWarnings(userId) {
-    warningsMap.delete(userId);
-}
-
-// Control de respuestas duplicadas
-function markMessageAsResponded(messageId) {
-    if (respondedMessages.has(messageId)) return;
-    respondedMessages.add(messageId);
-    respondedIdsOrder.push(messageId);
-    // Si excede el límite, eliminar el más antiguo
-    if (respondedIdsOrder.length > MAX_RESPONDED_IDS) {
-        const oldest = respondedIdsOrder.shift();
-        respondedMessages.delete(oldest);
-    }
-}
-
-function wasMessageResponded(messageId) {
-    return respondedMessages.has(messageId);
 }
 
 // ========== LLAMADA A OPENROUTER CON FAILOVER ==========
@@ -385,73 +341,6 @@ const useSupabaseAuthState = async () => {
     };
 };
 
-// ========== COLAS DE PROCESAMIENTO ==========
-class SimpleQueue {
-    constructor() {
-        this.tasks = [];
-        this.running = false;
-    }
-    enqueue(task) {
-        return new Promise((res, rej) => {
-            this.tasks.push({ task, res, rej });
-            this._runNext();
-        });
-    }
-    async _runNext() {
-        if (this.running) return;
-        const next = this.tasks.shift();
-        if (!next) return;
-        this.running = true;
-        try {
-            const result = await next.task();
-            next.res(result);
-        } catch (e) {
-            next.rej(e);
-        } finally {
-            this.running = false;
-            setTimeout(() => this._runNext(), 250); // pequeño delay entre tareas
-        }
-    }
-    length() {
-        return this.tasks.length + (this.running ? 1 : 0);
-    }
-}
-const aiQueue = new SimpleQueue();
-
-// ========== VARIABLES PARA SILENCIO / NUDGES ==========
-let lastActivity = Date.now();
-let lastNudgeTime = 0;
-let nudgeSent = false;
-let silentCooldownUntil = 0;
-const SILENCE_THRESHOLD = 1000 * 60 * 60; // 60 minutos
-const RESPONSE_WINDOW_AFTER_NUDGE = 1000 * 60 * 10; // 10 min
-const MIN_COOLDOWN = 1000 * 60 * 60 * 2; // 2h
-const MAX_COOLDOWN = 1000 * 60 * 60 * 3; // 3h
-
-// Frases de nudge (más variadas)
-const nudgeMessages = [
-    "¿Están muy callados hoy? 😶",
-    "eh, ¿nadie está por aquí? 😅",
-    "¿Alguien conectado? 🎮",
-    "Se siente un silencio raro... ¿todo bien? 🤔",
-    "¿En qué están pensando? Yo estoy aburrida 🙃",
-    "Parece que el grupo se fue a dormir 😴",
-    "¿Alguien quiere jugar algo? Yo solo converso 😊",
-    "Holaaaa, ¿hay alguien vivo por aquí? 👻",
-    "30 minutos sin mensajes... ¿les pasa algo? 🤨",
-    "Me siento como en una biblioteca 📚... ¡hablen! 🗣️"
-];
-
-const ignoredMessages = [
-    "¿Me están ignorando? 😭",
-    "Bueno, voy a estar por aquí, avísenme si vuelven 😕",
-    "Parece que me dejaron sola 🥲",
-    "☹️ nadie me responde... en fin, seguiré esperando",
-    "Y yo que quería conversar... bueno, ahí les encargo 😿",
-    "😤 ya no digo nada entonces",
-    "💔"
-];
-
 // ========== INICIAR BOT ==========
 async function startBot() {
     console.log('--- Iniciando Shiro Synthesis Two (SST) ---');
@@ -517,6 +406,12 @@ async function startBot() {
                 const participant = msg.key.participant || remoteJid;
                 const pushName = msg.pushName || '';
 
+                // LOG temporal (puedes eliminar)
+                console.log(`[LOG] remoteJid=${remoteJid} participant=${participant} pushName="${pushName}"`);
+                lastSeenGroupIds.add(remoteJid);
+                lastSeenParticipants.add(participant);
+                if (ADMIN_WHATSAPP_ID && participant === ADMIN_WHATSAPP_ID) lastSeenAdminCandidate = participant;
+
                 const isPrivateChat = remoteJid.endsWith('@s.whatsapp.net');
                 const isTargetGroup = (TARGET_GROUP_ID && remoteJid === TARGET_GROUP_ID);
 
@@ -545,26 +440,15 @@ async function startBot() {
                     if (messageHistory.length > 30) messageHistory.shift();
                 }
 
-                // Verificar si ya respondimos a este mensaje (por ID)
-                if (wasMessageResponded(msg.key.id)) {
-                    console.log('Mensaje ya respondido anteriormente, ignorando.');
+                // Responder a privados
+                if (isPrivateChat) {
+                    await sock.sendMessage(remoteJid, {
+                        text: 'Lo siento, solo atiendo en el grupo. Contacta al admin para atención privada.'
+                    }, { quoted: msg });
                     continue;
                 }
 
-                // ========== RESPUESTA A PRIVADOS ==========
-                if (isPrivateChat) {
-                    if (participant === ADMIN_WHATSAPP_ID) {
-                        // Admin puede conversar en privado (se procesará con IA más abajo si procede)
-                        // No enviamos mensaje de restricción, continuamos.
-                    } else {
-                        await sock.sendMessage(remoteJid, {
-                            text: 'Lo siento, solo atiendo en el grupo. Contacta al admin para atención privada.'
-                        }, { quoted: msg });
-                        continue;
-                    }
-                }
-
-                if (!isTargetGroup && !isPrivateChat) continue; // Solo grupo o privado admin
+                if (!isTargetGroup) continue;
 
                 // ========== MODERACIÓN DE ENLACES ==========
                 const urls = messageText.match(urlRegex);
@@ -574,27 +458,12 @@ async function startBot() {
                         console.log('Enlace no permitido detectado, eliminando...');
                         try {
                             await sock.sendMessage(remoteJid, { delete: msg.key });
-                            // Incrementar advertencia
-                            const warningCount = incrementWarning(participant);
-                            const warnText = `🚫 @${pushName || participant.split('@')[0]} — Ese enlace no está permitido. Advertencia ${warningCount}/${MAX_WARNINGS}. Solo aceptamos links de YouTube, Facebook, Instagram, TikTok, Twitter y Twitch.`;
+                            const warnText = `🚫 @${pushName || participant.split('@')[0]} — Ese enlace no está permitido. Solo aceptamos links de YouTube, Facebook, Instagram, TikTok, Twitter, WhatsApp y Twitch.`;
                             await sock.sendMessage(remoteJid, { text: warnText + '\n\n— Shiro Synthesis Two' }, { quoted: msg });
-
-                            if (warningCount >= MAX_WARNINGS) {
-                                // Expulsar del grupo
-                                try {
-                                    await sock.groupParticipantsUpdate(remoteJid, [participant], 'remove');
-                                    await sock.sendMessage(remoteJid, { text: `@${pushName} ha sido eliminado por exceder el máximo de advertencias.` });
-                                    resetWarnings(participant);
-                                } catch (e) {
-                                    console.error('No pude expulsar, ¿soy admin?', e);
-                                }
-                            }
                         } catch (e) {
                             console.log('No pude borrar el mensaje (¿soy admin?)', e.message);
                             await sock.sendMessage(remoteJid, { text: '🚫 Enlaces no permitidos aquí.' }, { quoted: msg });
                         }
-                        // Marcar como respondido para no volver a procesar
-                        markMessageAsResponded(msg.key.id);
                         continue;
                     }
                 }
@@ -607,17 +476,14 @@ async function startBot() {
                         await sock.sendMessage(remoteJid, {
                             text: '⚠️ Este grupo evita debates políticos/religiosos. Cambiemos de tema, por favor.'
                         }, { quoted: msg });
-                        markMessageAsResponded(msg.key.id);
                         continue;
                     }
                 }
 
                 // ========== OFERTAS / REDIRECCIÓN A ADMIN ==========
-                // Si el usuario es el admin, no redirigimos
-                if (OFFERS_KEYWORDS.some(k => plainLower.includes(k)) && participant !== ADMIN_WHATSAPP_ID) {
+                if (OFFERS_KEYWORDS.some(k => plainLower.includes(k))) {
                     const txt = `📢 @${pushName || participant.split('@')[0]}: Para ofertas y ventas, contacta al admin Asche Synthesis One por privado.`;
                     await sock.sendMessage(remoteJid, { text: txt }, { quoted: msg });
-                    markMessageAsResponded(msg.key.id);
                     continue;
                 }
 
@@ -633,7 +499,6 @@ async function startBot() {
                         lastGreetingTime[participant] = now;
                         const reply = `¡Hola ${pushName || ''}! 😄\nSoy Shiro Synthesis Two — ¿en qué te ayudo?`;
                         await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
-                        markMessageAsResponded(msg.key.id);
                     }
                     continue;
                 }
@@ -647,52 +512,46 @@ async function startBot() {
                 const isLongMessage = messageText.length > 100;
                 const spontaneousIntervention = !addressedToShiro && !looksLikeQuestion && isLongMessage && Math.random() < 0.1;
 
-                const shouldUseAI = addressedToShiro || looksLikeQuestion || spontaneousIntervention || (isPrivateChat && participant === ADMIN_WHATSAPP_ID);
+                const shouldUseAI = addressedToShiro || looksLikeQuestion || spontaneousIntervention;
 
-                if (!shouldUseAI) continue;
+                if (shouldUseAI) {
+                    // Sin mensaje de "procesando", encolamos silenciosamente
+                    aiQueue.enqueue(async () => {
+                        // Construir mensajes para IA: incluir historial reciente + el mensaje actual
+                        const historyMessages = messageHistory.slice(-30).map(m => ({
+                            role: 'user',
+                            content: `${m.pushName}: ${m.text}`
+                        }));
 
-                // ========== PROCESAR CON IA ==========
-                aiQueue.enqueue(async () => {
-                    // Construir mensajes para IA: incluir historial reciente + el mensaje actual
-                    const historyMessages = messageHistory.slice(-30).map(m => ({
-                        role: 'user',
-                        content: `${m.pushName}: ${m.text}`
-                    }));
+                        const currentUserMsg = `${pushName || 'Alguien'}: ${messageText}`;
+                        const messagesForAI = [
+                            { role: 'system', content: SYSTEM_PROMPT },
+                            ...historyMessages,
+                            { role: 'user', content: currentUserMsg }
+                        ];
 
-                    const currentUserMsg = `${pushName || 'Alguien'}: ${messageText}`;
-                    const messagesForAI = [
-                        { role: 'system', content: SYSTEM_PROMPT },
-                        ...historyMessages,
-                        { role: 'user', content: currentUserMsg }
-                    ];
+                        const aiResp = await callOpenRouterWithFallback(messagesForAI);
 
-                    const aiResp = await callOpenRouterWithFallback(messagesForAI);
+                        // Si la IA responde "SKIP" (o similar), no enviamos nada
+                        if (aiResp && aiResp.trim().toUpperCase() === 'SKIP') {
+                            console.log('IA decidió no responder (SKIP)');
+                            return;
+                        }
 
-                    // Si la IA responde "SKIP" (o similar), no enviamos nada
-                    if (aiResp && aiResp.trim().toUpperCase() === 'SKIP') {
-                        console.log('IA decidió no responder (SKIP)');
-                        return;
-                    }
+                        let replyText = aiResp || 'Lo siento, ahora mismo no puedo pensar bien 😅. Pregúntale al admin si es urgente.';
+                        if (/no estoy segura|no sé|no se|no tengo información/i.test(replyText)) {
+                            replyText += '\n\n*Nota:* mi info puede estar desactualizada (Feb 2026). Pregunta al admin para confirmar.';
+                        }
 
-                    let replyText = aiResp || 'Lo siento, ahora mismo no puedo pensar bien 😅. Pregúntale al admin si es urgente.';
-                    if (/no estoy segura|no sé|no se|no tengo información/i.test(replyText)) {
-                        replyText += '\n\n*Nota:* mi info puede estar desactualizada (Feb 2026). Pregunta al admin para confirmar.';
-                    }
+                        replyText = sanitizeAI(replyText);
+                        const important = /🚫|⚠️|admin|oferta|ofertas|precio/i.test(replyText) || replyText.length > 300;
+                        if (important && !replyText.includes('— Shiro Synthesis Two')) {
+                            replyText += `\n\n— Shiro Synthesis Two`;
+                        }
 
-                    // Añadir estado de ánimo del bot con probabilidad (5%)
-                    const moodPhrase = getMoodPhrase();
-                    if (moodPhrase) replyText += moodPhrase;
-
-                    replyText = sanitizeAI(replyText);
-                    const important = /🚫|⚠️|admin|oferta|ofertas|precio/i.test(replyText) || replyText.length > 300;
-                    if (important && !replyText.includes('— Shiro Synthesis Two')) {
-                        replyText += `\n\n— Shiro Synthesis Two`;
-                    }
-
-                    await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
-                    markMessageAsResponded(msg.key.id);
-                }).catch(e => console.error('Error en tarea de IA', e));
-
+                        await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
+                    }).catch(e => console.error('Error en tarea de IA', e));
+                }
             } catch (err) {
                 console.error('Error procesando mensaje', err);
             }
@@ -702,7 +561,7 @@ async function startBot() {
 
 // ========== CHECKER DE SILENCIO (NUDGES) ==========
 function startSilenceChecker() {
-    intervalID = setInterval(async () => {
+    setInterval(async () => {
         try {
             const now = Date.now();
             if (now < silentCooldownUntil) return;
@@ -746,6 +605,14 @@ app.get('/qr', async (req, res) => {
     } catch (err) {
         res.status(500).send('Error QR');
     }
+});
+// Endpoint de debug (puedes eliminarlo después)
+app.get('/debug-ids', (req, res) => {
+    res.json({
+        lastSeenGroupIds: Array.from(lastSeenGroupIds),
+        lastSeenParticipants: Array.from(lastSeenParticipants),
+        lastSeenAdminCandidate
+    });
 });
 app.listen(PORT, () => console.log(`🌐 Servidor web en puerto ${PORT}`));
 
