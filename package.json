@@ -11,7 +11,7 @@
   "author": "Asche",
   "license": "MIT",
   "dependencies": {
-    "@supabase/supabase-js": "^2.0.0",
+    "@supabase/supabase-js": "^2.25.0",
     "@whiskeysockets/baileys": "^6.6.0",
     "axios": "^1.6.8",
     "express": "^4.18.2",
