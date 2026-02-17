@@ -1,6 +1,19 @@
 /**
  * sst-bot.js
- * Shiro Synthesis Two - Versión Definitiva con reconocimiento robusto de admin.
+ * Shiro Synthesis Two - Versión COMPLETA con prompt fijo en código y todas las funciones.
+ * 
+ * Incluye:
+ * - Reconocimiento de admin con ID terminado en @lid
+ * - Respuesta en privado solo para admin
+ * - Comandos de admin (sugerencias, revisadas, cambiar rasgos, etc.)
+ * - Moderación de enlaces, política/religión, ofertas
+ * - Memoria persistente de usuarios (Supabase)
+ * - Sistema de sugerencias
+ * - Detección de repeticiones (por texto exacto y similitud)
+ * - Cola inteligente para evitar saturación
+ * - Nudges por silencio con drama opcional
+ * - Estados animados según hora
+ * - Historial de mensajes en memoria (no persistente)
  */
 
 const {
@@ -16,7 +29,7 @@ const QRCode = require('qrcode');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-// ========== CONFIG DESDE ENV ==========
+// ========== CONFIGURACIÓN DESDE VARIABLES DE ENTORNO ==========
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
@@ -25,80 +38,87 @@ const ADMIN_WHATSAPP_ID = process.env.ADMIN_WHATSAPP_ID || ''; // Tu ID (ej: 125
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const TIMEZONE = process.env.TIMEZONE || 'America/Mexico_City';
 
+// Modelos de OpenRouter (separados por coma)
 const OPENROUTER_MODELS = process.env.OPENROUTER_MODEL
   ? process.env.OPENROUTER_MODEL.split(',').map(m => m.trim())
   : ['openrouter/free'];
 
-// Constantes
-const MAX_HISTORY_MESSAGES = 50;
-const WARN_LIMIT = 4;
-const RESPONSE_MEMORY_HOURS = 24;
-const STATE_CHANCE = 0.05;
-const SPONTANEOUS_CHANCE = 0.4;
-const LONG_MESSAGE_THRESHOLD = 100;
-const DUPLICATE_MESSAGE_WINDOW = 5 * 60 * 1000;
-const SIMILARITY_THRESHOLD = 0.6;
-const USER_COOLDOWN_MS = 5000;
+// ========== CONSTANTES DE CONFIGURACIÓN ==========
+const MAX_HISTORY_MESSAGES = 50;          // Número de mensajes a recordar en contexto
+const WARN_LIMIT = 4;                      // Máximo de advertencias antes de expulsar
+const RESPONSE_MEMORY_HOURS = 24;          // Tiempo para considerar un mensaje como "ya respondido"
+const STATE_CHANCE = 0.05;                  // 5% de probabilidad de incluir estado animado
+const SPONTANEOUS_CHANCE = 0.4;             // 40% de intervenir en mensajes largos sin mención
+const LONG_MESSAGE_THRESHOLD = 100;         // Caracteres para considerar mensaje largo
+const DUPLICATE_MESSAGE_WINDOW = 5 * 60 * 1000; // 5 minutos para detectar duplicados exactos
+const SIMILARITY_THRESHOLD = 0.6;            // Umbral de similitud para considerar repetición
+const USER_COOLDOWN_MS = 5000;               // 5 segundos entre respuestas al mismo usuario (no admin)
 
+// Validación de API key
 if (!OPENROUTER_API_KEY) {
-  console.error('❌ ERROR: OPENROUTER_API_KEY no configurada');
+  console.error('❌ ERROR: OPENROUTER_API_KEY no está configurada');
   process.exit(1);
 }
 
 const logger = P({ level: 'fatal' });
 
-// ========== SUPABASE ==========
+// ========== CLIENTE SUPABASE (OPCIONAL) ==========
 let supabaseClient = null;
 if (SUPABASE_URL && SUPABASE_KEY) {
   supabaseClient = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
-  console.log('✅ Supabase configurado');
+  console.log('✅ Supabase configurado correctamente');
 } else {
-  console.warn('⚠️ Supabase no configurado, usando memoria volátil');
+  console.warn('⚠️ Supabase no configurado. Se usará memoria volátil (los datos se perderán al reiniciar).');
 }
 
 // ========== ESTADO GLOBAL ==========
 let latestQR = null;
 let sock = null;
-let intervalID = null;
-let messageHistory = [];
+let intervalID = null;                // Para el checker de silencio
+let messageHistory = [];               // Historial en memoria (grupo)
 let lastActivity = Date.now();
 let lastNudgeTime = 0;
 let nudgeSent = false;
 let silentCooldownUntil = 0;
 
-// Memorias en memoria (fallback)
-let inMemoryWarnings = new Map();
-let inMemoryUserMemory = new Map();
-let inMemoryRespondedMessages = new Map();
-let inMemorySuggestions = [];
-let inMemoryLastUserMessages = new Map();
-let inMemoryLastResponseTime = new Map();
+// Estructuras en memoria (fallback cuando no hay Supabase)
+let inMemoryWarnings = new Map();               // participant -> { count, lastWarning }
+let inMemoryUserMemory = new Map();              // participant -> { data, updated }
+let inMemoryRespondedMessages = new Map();       // participant -> [{ text, response, timestamp }]
+let inMemorySuggestions = [];                    // [{ participant, name, text, isPositive, reviewed, timestamp }]
+let inMemoryLastUserMessages = new Map();        // participant -> { text, timestamp } (último mensaje)
+let inMemoryLastResponseTime = new Map();        // participant -> timestamp (última respuesta)
 let inMemoryBotConfig = {
-  promptBase: '',
   personalityTraits: {},
   allowPersonalityChanges: true
 };
 
-// Cola inteligente
+// ========== COLA INTELIGENTE ==========
 class SmartQueue {
   constructor() {
-    this.tasks = new Map();
+    this.tasks = new Map();  // clave: participant, valor: { task, timestamp }
     this.processing = false;
   }
+
   enqueue(participant, task) {
+    // Reemplaza cualquier tarea anterior del mismo usuario (solo se procesa la última)
     this.tasks.set(participant, { task, timestamp: Date.now() });
     this._startProcessing();
   }
+
   _startProcessing() {
     if (this.processing) return;
     this.processing = true;
     this._processNext();
   }
+
   async _processNext() {
     if (this.tasks.size === 0) {
       this.processing = false;
       return;
     }
+
+    // Encontrar la tarea más antigua (por timestamp)
     let oldest = null;
     let oldestKey = null;
     for (const [key, value] of this.tasks.entries()) {
@@ -107,16 +127,20 @@ class SmartQueue {
         oldestKey = key;
       }
     }
+
     if (oldest) {
       this.tasks.delete(oldestKey);
       try {
         await oldest.task();
       } catch (e) {
-        console.error('Error en tarea IA:', e);
+        console.error('Error en tarea de IA:', e);
       }
     }
+
+    // Pequeña pausa antes de la siguiente tarea
     setTimeout(() => this._processNext(), 250);
   }
+
   clear() {
     this.tasks.clear();
     this.processing = false;
@@ -124,24 +148,37 @@ class SmartQueue {
 }
 const aiQueue = new SmartQueue();
 
-// ========== LISTAS ==========
+// ========== LISTAS PARA MODERACIÓN ==========
 const ALLOWED_DOMAINS = [
-  'youtube.com', 'youtu.be', 'facebook.com', 'fb.com', 'instagram.com',
-  'tiktok.com', 'twitter.com', 'x.com', 'twitch.tv'
+  'youtube.com', 'youtu.be',
+  'facebook.com', 'fb.com',
+  'instagram.com',
+  'tiktok.com',
+  'twitter.com', 'x.com',
+  'twitch.tv'
 ];
 const urlRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)/gi;
 
 const POLITICS_RELIGION_KEYWORDS = ['política', 'político', 'gobierno', 'religión', 'dios', 'iglesia', 'ateo', 'creencia', 'inmigración'];
 const OFFERS_KEYWORDS = ['oferta', 'ofertas', 'precio', 'vender', 'compra', 'rebaja', 'promo', 'promoción', 'pago'];
 
-const GREETINGS = ['hola', 'holaa', 'buenas', 'buenas tardes', 'buenas noches', 'buen día', 'buenos días', 'hey', 'hi', 'hello', 'ola', 'qué tal', 'quetal', 'qué onda', 'q onda'];
+// ========== SALUDOS ==========
+const GREETINGS = [
+  'hola', 'holaa', 'buenas', 'buenas tardes', 'buenas noches', 'buen día', 'buenos días',
+  'hey', 'hi', 'hello', 'ola', 'qué tal', 'quetal', 'qué onda', 'q onda'
+];
 const lastGreetingTime = {};
-const GREETING_COOLDOWN = 1000 * 60 * 10;
+const GREETING_COOLDOWN = 1000 * 60 * 10; // 10 minutos
 
-const SUGGESTION_TRIGGERS = ['te doy una sugerencia', 'sugiero que', 'mi sugerencia es', 'deberías', 'podrías mejorar', 'sería bueno que', 'propongo que', 'quiero sugerir'];
+// ========== SUGERENCIAS ==========
+const SUGGESTION_TRIGGERS = [
+  'te doy una sugerencia', 'sugiero que', 'mi sugerencia es', 'deberías', 'podrías mejorar',
+  'sería bueno que', 'propongo que', 'quiero sugerir'
+];
 const POSITIVE_SUGGESTION_KEYWORDS = ['mejorar', 'bueno', 'genial', 'excelente', 'ayudaría', 'agradecería'];
 const NEGATIVE_SUGGESTION_KEYWORDS = ['molesto', 'molesta', 'fastidio', 'pesado', 'aburrido', 'no me gusta', 'odio', 'horrible'];
 
+// ========== ESTADOS ANIMADOS ==========
 const TIME_BASED_STATES = {
   morning: ['☀️ Buenos días, estoy desayunando cereal', '🌅 Recién despierta, dame un segundo', '🍳 Preparando café mientras leo sus mensajes'],
   afternoon: ['🌞 Tomando un poco de sol virtual', '🍵 Hora del té, ¿se apuntan?', '📚 Estudiando un rato, pero siempre atenta'],
@@ -149,14 +186,14 @@ const TIME_BASED_STATES = {
   night: ['🌙 Con sueño pero aquí sigo', '🦉 Modo búho activado', '💤 Casi dormida, cuéntenme rápido']
 };
 
-// Palabras de gravedad para moderación
+// ========== PALABRAS DE GRAVEDAD ==========
 const HIGH_SEVERITY_KEYWORDS = [
   'código fuente', 'source code', 'dame permisos de admin', 'hazme admin',
   'dame el control', 'quiero ser admin', 'elimina a', 'banea a', 'expulsa a',
   'cambia la configuración', 'modifica el prompt', 'cambia tu personalidad'
 ];
 
-// ========== PROMPT BASE (se puede modificar con comandos) ==========
+// ========== PROMPT BASE (FIJO EN CÓDIGO) ==========
 const DEFAULT_SYSTEM_PROMPT = `
 Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime joven (aparentas menos de 20 años), pero con una personalidad compleja y un trasfondo dramático.
 
@@ -223,11 +260,10 @@ Eres carismática, enérgica, juguetona y a veces un poco sarcástica o tímida 
 
 ### ⚙️ Comandos de admin (solo por privado)
 El admin puede darte órdenes especiales. Debes confirmar cada cambio preguntando "¿Estás seguro de que quieres que [acción]?". Ejemplos de comandos:
-- "Shiro, cambia tu personalidad a más tierna"
-- "Shiro, modifica tu prompt: añade que eres fan de los gatos"
+- "Shiro, cambia tu personalidad a más tierna" (esto modificará los rasgos, no el prompt completo)
 - "Shiro, ¿qué configuración tienes?"
 - "Shiro, restablece la configuración por defecto"
-- "Shiro, deja de mencionar recargas"
+- "Shiro, deja de mencionar recargas" (esto ajusta un flag, no el prompt)
 
 Siempre debes confirmar antes de aplicar cambios importantes. Si el comando no es claro, pide aclaración.
 
@@ -318,20 +354,17 @@ function canRespondToUser(participant) {
   return true;
 }
 
-// Extraer número base de un ID (quita sufijo)
 function getBaseNumber(participant) {
   if (!participant) return '';
   const atIndex = participant.indexOf('@');
   return atIndex === -1 ? participant : participant.substring(0, atIndex);
 }
 
-// Comparar si dos IDs corresponden al mismo usuario (ignorando sufijo)
 function isSameUser(id1, id2) {
   if (!id1 || !id2) return false;
   return getBaseNumber(id1) === getBaseNumber(id2);
 }
 
-// Evaluar gravedad del mensaje (para no admins)
 function getMessageSeverity(text) {
   const lower = text.toLowerCase();
   let severity = 0;
@@ -343,7 +376,7 @@ function getMessageSeverity(text) {
   return severity;
 }
 
-// ========== FUNCIONES SUPABASE / MEMORIA ==========
+// ========== FUNCIONES DE ACCESO A SUPABASE / MEMORIA ==========
 async function getUserWarnings(participant) {
   if (supabaseClient) {
     const { data, error } = await supabaseClient
@@ -463,7 +496,7 @@ async function markSuggestionsReviewed(ids) {
   }
 }
 
-// Configuración del bot
+// Configuración del bot (solo rasgos, NO prompt)
 async function loadBotConfig() {
   if (supabaseClient) {
     const { data, error } = await supabaseClient
@@ -473,11 +506,10 @@ async function loadBotConfig() {
       .maybeSingle();
     if (error) {
       console.error('Error loading bot config:', error.message);
-      return { promptBase: DEFAULT_SYSTEM_PROMPT, personalityTraits: {}, allowPersonalityChanges: true };
+      return { personalityTraits: {}, allowPersonalityChanges: true };
     }
     if (data) {
       return {
-        promptBase: data.prompt_base || DEFAULT_SYSTEM_PROMPT,
         personalityTraits: data.personality_traits || {},
         allowPersonalityChanges: data.allow_personality_changes !== false
       };
@@ -485,12 +517,11 @@ async function loadBotConfig() {
       // Crear configuración por defecto
       await supabaseClient.from('bot_config').insert({
         key: 'main',
-        prompt_base: DEFAULT_SYSTEM_PROMPT,
         personality_traits: {},
         allow_personality_changes: true,
         updated_at: new Date()
       });
-      return { promptBase: DEFAULT_SYSTEM_PROMPT, personalityTraits: {}, allowPersonalityChanges: true };
+      return { personalityTraits: {}, allowPersonalityChanges: true };
     }
   } else {
     return inMemoryBotConfig;
@@ -503,7 +534,6 @@ async function saveBotConfig(config) {
       .from('bot_config')
       .upsert({
         key: 'main',
-        prompt_base: config.promptBase,
         personality_traits: config.personalityTraits,
         allow_personality_changes: config.allowPersonalityChanges,
         updated_at: new Date()
@@ -513,7 +543,7 @@ async function saveBotConfig(config) {
   }
 }
 
-// ========== LLAMADA A OPENROUTER ==========
+// ========== LLAMADA A OPENROUTER CON FAILOVER ==========
 async function callOpenRouterWithFallback(messages) {
   for (const model of OPENROUTER_MODELS) {
     try {
@@ -532,7 +562,7 @@ async function callOpenRouterWithFallback(messages) {
         const choice = res.data?.choices?.[0];
         const content = choice?.message?.content ?? choice?.message ?? choice?.text ?? null;
         if (content) {
-          console.log(`✅ Respuesta con modelo: ${model}`);
+          console.log(`✅ Respuesta obtenida con modelo: ${model}`);
           return sanitizeAI(String(content));
         }
       }
@@ -544,10 +574,10 @@ async function callOpenRouterWithFallback(messages) {
   return null;
 }
 
-// ========== AUTH ==========
+// ========== AUTENTICACIÓN (SUPABASE O MEMORIA) ==========
 const useSupabaseAuthState = async () => {
   if (!supabaseClient) {
-    console.warn('⚠️ Usando credenciales en memoria');
+    console.warn('⚠️ Usando credenciales en memoria (no persistente)');
     const creds = initAuthCreds();
     const storeKeys = {};
     return {
@@ -623,7 +653,7 @@ const useSupabaseAuthState = async () => {
   };
 };
 
-// ========== CHECKER DE SILENCIO ==========
+// ========== CHECKER DE SILENCIO (NUDGES) ==========
 function startSilenceChecker() {
   if (intervalID) clearInterval(intervalID);
   intervalID = setInterval(async () => {
@@ -631,7 +661,7 @@ function startSilenceChecker() {
       const now = Date.now();
       if (now < silentCooldownUntil) return;
       if (!nudgeSent && (now - lastActivity) > SILENCE_THRESHOLD) {
-        const useDrama = Math.random() < 0.3;
+        const useDrama = Math.random() < 0.3; // 30% de drama
         let nudge;
         if (useDrama) {
           const dramaPhrases = [
@@ -649,6 +679,7 @@ function startSilenceChecker() {
           await sock.sendMessage(TARGET_GROUP_ID, { text: nudge });
           lastNudgeTime = Date.now();
           nudgeSent = true;
+
           setTimeout(() => {
             if (lastActivity <= lastNudgeTime) {
               const cooldown = MIN_COOLDOWN + Math.floor(Math.random() * (MAX_COOLDOWN - MIN_COOLDOWN + 1));
@@ -673,9 +704,8 @@ function startSilenceChecker() {
 async function startBot() {
   console.log('--- Iniciando Shiro Synthesis Two ---');
 
-  // Cargar configuración
+  // Cargar configuración (solo rasgos)
   const botConfig = await loadBotConfig();
-  let currentPromptBase = botConfig.promptBase;
 
   const { state, saveCreds } = await useSupabaseAuthState();
   const { version } = await fetchLatestBaileysVersion();
@@ -710,7 +740,7 @@ async function startBot() {
     }
   });
 
-  // Bienvenida a nuevos miembros
+  // Evento de nuevos participantes (bienvenida)
   sock.ev.on('group-participants.update', async (update) => {
     try {
       const { id, participants, action } = update;
@@ -727,7 +757,7 @@ async function startBot() {
     } catch (e) { console.error('Welcome error', e); }
   });
 
-  // Procesar mensajes
+  // Procesamiento de mensajes
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages) {
@@ -740,7 +770,6 @@ async function startBot() {
 
         const isPrivateChat = remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid');
         const isTargetGroup = (TARGET_GROUP_ID && remoteJid === TARGET_GROUP_ID);
-        // Determinar si es admin comparando números base
         const isAdmin = isSameUser(participant, ADMIN_WHATSAPP_ID);
 
         const messageText = msg.message?.conversation ||
@@ -753,19 +782,16 @@ async function startBot() {
 
         if (isTargetGroup) lastActivity = Date.now();
 
-        // Guardar en historial (grupo)
         if (isTargetGroup && messageText) {
           messageHistory.push({ id: msg.key.id, participant, pushName, text: messageText, timestamp: Date.now(), isBot: false });
           if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
         }
 
-        // ===== PRIVADO =====
+        // ===== RESPUESTA A PRIVADOS =====
         if (isPrivateChat) {
           if (isAdmin) {
-            // Admin: procesar normalmente (incluye comandos)
-            await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, true, botConfig, currentPromptBase);
+            await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, true, botConfig);
           } else {
-            // No admin: responder con mensaje fijo
             await sock.sendMessage(remoteJid, {
               text: 'Lo siento, solo atiendo en el grupo. Si necesitas ayuda, pregunta en el grupo. Para ofertas, contacta al admin.'
             }, { quoted: msg });
@@ -775,9 +801,9 @@ async function startBot() {
 
         if (!isTargetGroup) continue;
 
-        // ===== SI ES ADMIN, OMITIR RESTRICCIONES =====
+        // Si es admin en grupo, procesar normalmente (sin restricciones)
         if (isAdmin) {
-          await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, true, botConfig, currentPromptBase);
+          await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, true, botConfig);
           continue;
         }
 
@@ -786,7 +812,7 @@ async function startBot() {
         if (urls) {
           const hasDisallowed = urls.some(url => !isAllowedDomain(url));
           if (hasDisallowed) {
-            console.log('Enlace no permitido, eliminando...');
+            console.log('Enlace no permitido detectado, eliminando...');
             try {
               await sock.sendMessage(remoteJid, { delete: msg.key });
               const warnCount = await incrementUserWarnings(participant);
@@ -811,7 +837,7 @@ async function startBot() {
           }
         }
 
-        // ===== POLÍTICA/RELIGIÓN =====
+        // ===== MODERACIÓN POLÍTICA/RELIGIÓN =====
         if (POLITICS_RELIGION_KEYWORDS.some(k => plainLower.includes(k))) {
           const containsDebateTrigger = plainLower.includes('gobierno') || plainLower.includes('política') ||
             plainLower.includes('impuesto') || plainLower.includes('ataque') || plainLower.includes('insulto');
@@ -824,7 +850,7 @@ async function startBot() {
           }
         }
 
-        // ===== OFERTAS (redirigir) =====
+        // ===== OFERTAS / REDIRECCIÓN A ADMIN =====
         if (OFFERS_KEYWORDS.some(k => plainLower.includes(k))) {
           const txt = `📢 @${pushName || participant.split('@')[0]}: Para ofertas y ventas, contacta al admin Asche Synthesis One por privado.`;
           await sock.sendMessage(remoteJid, { text: txt }, { quoted: msg });
@@ -839,8 +865,8 @@ async function startBot() {
           continue;
         }
 
-        // ===== PROCESAR MENSAJE CON IA =====
-        await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, false, botConfig, currentPromptBase);
+        // ===== MANEJO GENERAL DEL MENSAJE CON IA =====
+        await handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, false, botConfig);
 
       } catch (err) {
         console.error('Error procesando mensaje', err);
@@ -849,15 +875,14 @@ async function startBot() {
   });
 }
 
-// ===== FUNCIÓN PRINCIPAL PARA IA =====
-async function handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, isAdmin, botConfig, currentPromptBase) {
+// ===== FUNCIÓN PRINCIPAL PARA PROCESAR MENSAJES CON IA =====
+async function handleIncomingMessage(msg, participant, pushName, messageText, remoteJid, isAdmin, botConfig) {
   const plainLower = messageText.toLowerCase();
 
   // ===== EVALUAR GRAVEDAD (para no admins) =====
   if (!isAdmin) {
     const severity = getMessageSeverity(messageText);
     if (severity >= 2) {
-      // Respuesta severa
       const reply = `⚠️ @${pushName || participant.split('@')[0]}, no tienes permiso para hacer eso. Solo el admin puede cambiar configuraciones importantes.`;
       await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
       messageHistory.push({ id: `bot-${Date.now()}`, participant: 'bot', pushName: 'Shiro', text: reply, timestamp: Date.now(), isBot: true });
@@ -886,8 +911,8 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
   }
 
   // ===== COMANDOS DE ADMIN EN PRIVADO =====
-  if (isAdmin && remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid')) {
-    // Comandos especiales
+  if (isAdmin && (remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid'))) {
+    // Comando: sugerencias
     if (plainLower.startsWith('sugerencias')) {
       const suggestions = await getUnreviewedSuggestions();
       if (suggestions.length === 0) {
@@ -902,6 +927,8 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
       }
       return;
     }
+
+    // Comando: revisadas
     if (plainLower.startsWith('revisadas')) {
       const parts = plainLower.split(/\s+/);
       const indices = parts.slice(1).map(Number).filter(n => !isNaN(n) && n > 0);
@@ -918,48 +945,24 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
       return;
     }
 
-    // Comandos de configuración
-    if (plainLower.includes('cambia tu personalidad') || plainLower.includes('modifica tu prompt')) {
-      // Extraer el nuevo prompt/personalidad
-      const newPrompt = messageText.replace(/cambia tu personalidad|modifica tu prompt/i, '').trim();
-      if (newPrompt.length < 5) {
-        await sock.sendMessage(remoteJid, { text: '¿Qué quieres que cambie? Dame más detalles.' });
-        return;
-      }
-      // Confirmar
-      const confirmMsg = `¿Estás seguro de que quieres que cambie mi personalidad a: "${newPrompt}"? Responde "sí" para confirmar.`;
-      // Guardamos estado de espera de confirmación (simplificado: en memoria)
-      inMemoryLastResponseTime.set(`confirm_${participant}`, { action: 'change_prompt', newPrompt, timestamp: Date.now() });
-      await sock.sendMessage(remoteJid, { text: confirmMsg });
+    // Comando: cambiar personalidad (rasgos)
+    if (plainLower.includes('cambia tu personalidad')) {
+      // Por ahora solo un mensaje de ejemplo
+      await sock.sendMessage(remoteJid, { text: 'Por ahora solo puedo cambiar rasgos específicos. ¿Qué te gustaría ajustar? (ej: ser más tierna, más sarcástica)' });
       return;
     }
 
-    if (plainLower === 'sí' || plainLower === 'si') {
-      const pending = inMemoryLastResponseTime.get(`confirm_${participant}`);
-      if (pending && pending.action === 'change_prompt' && (Date.now() - pending.timestamp) < 60000) {
-        // Aplicar cambio
-        botConfig.promptBase = pending.newPrompt;
-        await saveBotConfig(botConfig);
-        currentPromptBase = pending.newPrompt;
-        await sock.sendMessage(remoteJid, { text: '✅ Personalidad actualizada. Ahora seré como me pediste.' });
-        inMemoryLastResponseTime.delete(`confirm_${participant}`);
-      } else {
-        await sock.sendMessage(remoteJid, { text: 'No hay ningún cambio pendiente o ha expirado.' });
-      }
+    // Comando: ver configuración
+    if (plainLower.includes('qué configuración tienes') || plainLower.includes('muestra tus rasgos')) {
+      await sock.sendMessage(remoteJid, { text: `Rasgos actuales: ${JSON.stringify(botConfig.personalityTraits)}. ¿Quieres cambiar algo?` });
       return;
     }
 
-    // Otros comandos
-    if (plainLower.includes('qué configuración tienes') || plainLower.includes('muestra tu prompt')) {
-      await sock.sendMessage(remoteJid, { text: `Mi prompt actual es:\n\n${botConfig.promptBase.substring(0, 1000)}...` });
-      return;
-    }
-
+    // Comando: restablecer configuración
     if (plainLower.includes('restablece la configuración')) {
-      botConfig.promptBase = DEFAULT_SYSTEM_PROMPT;
+      botConfig.personalityTraits = {};
       await saveBotConfig(botConfig);
-      currentPromptBase = DEFAULT_SYSTEM_PROMPT;
-      await sock.sendMessage(remoteJid, { text: 'Configuración restablecida a valores por defecto.' });
+      await sock.sendMessage(remoteJid, { text: 'Rasgos restablecidos a valores por defecto.' });
       return;
     }
   }
@@ -970,7 +973,7 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
     return;
   }
 
-  // ===== SALUDOS =====
+  // ===== SALUDOS CON COOLDOWN =====
   const trimmed = messageText.trim().toLowerCase();
   const isPureGreeting = GREETINGS.some(g => {
     return trimmed === g || trimmed === g + '!' || trimmed === g + '?' || trimmed.startsWith(g + ' ');
@@ -1010,13 +1013,13 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
     return;
   }
 
-  // Verificar similitud
+  // Verificar similitud con mensajes anteriores
   if (!isAdmin && await isSimilarToPrevious(participant, messageText)) {
     console.log('Mensaje similar a uno ya respondido, ignorando.');
     return;
   }
 
-  // ===== ENCOLAR RESPUESTA IA =====
+  // ===== ENCOLAR RESPUESTA DE IA =====
   aiQueue.enqueue(participant, async () => {
     const userMemory = await loadUserMemory(participant) || {};
 
@@ -1028,7 +1031,8 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
     const now = new Date();
     const dateStr = now.toLocaleString('es-ES', { timeZone: TIMEZONE, dateStyle: 'full', timeStyle: 'short' });
     const timePeriod = getCurrentTimeBasedState();
-    const systemPromptWithTime = `${currentPromptBase}\n\nFecha y hora actual: ${dateStr} (${timePeriod}).`;
+    // Usar el prompt fijo del código
+    const systemPromptWithTime = `${DEFAULT_SYSTEM_PROMPT}\n\nFecha y hora actual: ${dateStr} (${timePeriod}).`;
 
     const currentUserMsg = `${pushName || 'Alguien'}: ${messageText}`;
 
@@ -1076,7 +1080,7 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
 
     await addRespondedMessage(participant, messageText, replyText);
 
-    // Extraer datos de usuario
+    // Extraer datos de usuario (juegos favoritos)
     const gameKeywords = ['juego', 'juegos', 'mobile legends', 'ml', 'honkai', 'genshin', 'steam', 'play', 'xbox', 'nintendo'];
     if (gameKeywords.some(k => plainLower.includes(k))) {
       if (!userMemory.games) userMemory.games = [];
@@ -1092,11 +1096,11 @@ async function handleIncomingMessage(msg, participant, pushName, messageText, re
   });
 }
 
-// Constantes para nudges
-const SILENCE_THRESHOLD = 1000 * 60 * 60;
-const RESPONSE_WINDOW_AFTER_NUDGE = 1000 * 60 * 10;
-const MIN_COOLDOWN = 1000 * 60 * 60 * 2;
-const MAX_COOLDOWN = 1000 * 60 * 60 * 3;
+// ========== CONSTANTES PARA NUDGES ==========
+const SILENCE_THRESHOLD = 1000 * 60 * 60; // 60 minutos
+const RESPONSE_WINDOW_AFTER_NUDGE = 1000 * 60 * 10; // 10 min
+const MIN_COOLDOWN = 1000 * 60 * 60 * 2; // 2h
+const MAX_COOLDOWN = 1000 * 60 * 60 * 3; // 3h
 
 const nudgeMessages = [
   "¿Están muy callados hoy? 😶",
