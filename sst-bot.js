@@ -1134,8 +1134,8 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
   if (session.step === 'awaiting_payment_method') {
     const method = plainLower.includes('tarjeta') ? 'card' : (plainLower.includes('saldo') ? 'mobile' : null);
     if (!method) {
-      await sock.sendMessage(remoteJid, { text: '❌ Por favor, responde "tarjeta" o "saldo". (No me hagas repetir, que no soy disco rayado... aunque a veces me siento como un loop infinito de código)` });
-      return true;
+      await sock.sendMessage(remoteJid, { text: "❌ Por favor, responde \"tarjeta\" o \"saldo\". (No me hagas repetir, que no soy disco rayado... aunque a veces me siento como un loop infinito de código)" });
+      return saldo
     }
     session.paymentMethod = method;
     let total = 0;
