@@ -1104,7 +1104,7 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
   if (session.step === 'awaiting_offers_selection') {
     const indices = messageText.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0);
     if (indices.length === 0) {
-      await sock.sendMessage(remoteJid, { text: '❌ Por favor, responde con números válidos separados por coma. (Como la serie de números de la suerte... aunque no tengo suerte 😢)' });
+      await sock.sendMessage(remoteJid, { text: "❌ Por favor, responde \"tarjeta\" o \"saldo\". (No me hagas repetir, que no soy disco rayado... aunque a veces me siento como un loop infinito de código)" });
       return true;
     }
     const offers = JSON.parse(session.game.offers || '[]');
