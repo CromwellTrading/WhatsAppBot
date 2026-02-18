@@ -46,8 +46,8 @@ const OPENROUTER_MODELS = process.env.OPENROUTER_MODEL
 const MAX_HISTORY_MESSAGES = 50;
 const WARN_LIMIT = 4;
 const RESPONSE_MEMORY_HOURS = 24;
-const STATE_CHANCE = 0.05; // Probabilidad de añadir estado animado
-const SPONTANEOUS_CHANCE = 0.4; // Probabilidad de intervenir en mensajes largos
+const STATE_CHANCE = 0.05;
+const SPONTANEOUS_CHANCE = 0.4;
 const LONG_MESSAGE_THRESHOLD = 100;
 const DUPLICATE_MESSAGE_WINDOW = 5 * 60 * 1000;
 const SIMILARITY_THRESHOLD = 0.6;
@@ -772,6 +772,32 @@ async function getPendingOrders() {
   return data;
 }
 
+// ========== PARSEAR OFERTAS DE JUEGO ==========
+function parseGameOffers(text) {
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  let gameName = null;
+  let offers = [];
+
+  for (const line of lines) {
+    const gameMatch = line.match(/^🎮\s*(.+)$/i);
+    if (gameMatch) {
+      gameName = gameMatch[1].trim();
+      continue;
+    }
+
+    const offerMatch = line.match(/^(.+?)\s*☞\s*(\d+)\s*💳\s*\|\s*☞\s*(\d+)\s*📲/i);
+    if (offerMatch) {
+      offers.push({
+        name: offerMatch[1].trim(),
+        card_price: parseInt(offerMatch[2]),
+        mobile_price: parseInt(offerMatch[3])
+      });
+    }
+  }
+
+  return { gameName, offers };
+}
+
 // ========== AUTENTICACIÓN SUPABASE (AUTH SESSIONS) ==========
 const useSupabaseAuthState = async () => {
   const writeData = async (data, key) => {
@@ -939,11 +965,30 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
     return true;
   }
 
+  // Comandos de gestión de juegos (modo negocio)
   if (businessMode) {
+    // Añadir juego
     if (plainLower.startsWith('añadir juego')) {
-      pendingConfirmation = { type: 'add_game', step: 'awaiting_data' };
-      await sock.sendMessage(remoteJid, { text: '📝 Envía el nombre del juego seguido de las ofertas en el formato:\n\n🎮 NOMBRE\n\nOferta 1 ☞ precio tarjeta 💳 | ☞ precio saldo 📲\nOferta 2 ☞ ...\n\n(Espero que no me mandes un texto tan largo como el Quijote... aunque me encantaría, soy fan de Cervantes 😉)' });
-      return true;
+      if (pendingConfirmation && pendingConfirmation.type === 'add_game' && pendingConfirmation.step === 'awaiting_data') {
+        // Parsear el mensaje que contiene las ofertas
+        const parsed = parseGameOffers(messageText);
+        if (!parsed.gameName || parsed.offers.length === 0) {
+          await sock.sendMessage(remoteJid, { text: '❌ No pude entender el formato. Asegúrate de incluir 🎮 NOMBRE y las ofertas con ☞ precio 💳 | ☞ precio 📲' });
+          return true;
+        }
+        pendingConfirmation = {
+          type: 'add_game',
+          step: 'confirm',
+          gameName: parsed.gameName,
+          offers: parsed.offers
+        };
+        await sock.sendMessage(remoteJid, { text: `📦 *Juego detectado:* ${parsed.gameName}\n*Ofertas:* ${parsed.offers.length}\n\n¿Guardar? (responde "si" o "no")` });
+        return true;
+      } else {
+        pendingConfirmation = { type: 'add_game', step: 'awaiting_data' };
+        await sock.sendMessage(remoteJid, { text: '📝 Envía el nombre del juego seguido de las ofertas en el formato:\n\n🎮 NOMBRE\n\nOferta 1 ☞ precio tarjeta 💳 | ☞ precio saldo 📲\nOferta 2 ☞ ...' });
+        return true;
+      }
     }
 
     if (plainLower.startsWith('ver juegos')) {
@@ -985,15 +1030,48 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
     }
 
     if (plainLower.startsWith('añadir tarjeta')) {
-      pendingConfirmation = { type: 'add_card', step: 'awaiting_name' };
-      await sock.sendMessage(remoteJid, { text: '💳 Envíame el nombre de la tarjeta (ej: "Bandec"): (¿Será tan confiable como la tarjeta de crédito de mi creador? 😏)' });
-      return true;
+      if (pendingConfirmation && pendingConfirmation.type === 'add_card' && pendingConfirmation.step === 'awaiting_data') {
+        const lines = messageText.split('\n').map(l => l.trim()).filter(l => l.length);
+        if (lines.length >= 2) {
+          const name = lines[0];
+          const number = lines[1].replace(/\s/g, '');
+          pendingConfirmation = {
+            type: 'add_card',
+            step: 'confirm',
+            cardName: name,
+            cardNumber: number
+          };
+          await sock.sendMessage(remoteJid, { text: `💳 *Tarjeta:* ${name}\n*Número:* ${number}\n\n¿Guardar? (responde "si" o "no")` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Formato incorrecto. Envía el nombre en una línea y el número en otra.' });
+        }
+        return true;
+      } else {
+        pendingConfirmation = { type: 'add_card', step: 'awaiting_data' };
+        await sock.sendMessage(remoteJid, { text: '💳 Envíame el nombre de la tarjeta en una línea y el número en la siguiente línea.' });
+        return true;
+      }
     }
 
     if (plainLower.startsWith('añadir saldo')) {
-      pendingConfirmation = { type: 'add_mobile', step: 'awaiting_number' };
-      await sock.sendMessage(remoteJid, { text: '📱 Envíame el número de saldo móvil (ej: 59190241): (Recuerda, si es tu número, podré stalkearte... es broma... o no 👀)' });
-      return true;
+      if (pendingConfirmation && pendingConfirmation.type === 'add_mobile' && pendingConfirmation.step === 'awaiting_data') {
+        const number = messageText.replace(/\s/g, '');
+        if (/^\d{8,}$/.test(number)) {
+          pendingConfirmation = {
+            type: 'add_mobile',
+            step: 'confirm',
+            mobileNumber: number
+          };
+          await sock.sendMessage(remoteJid, { text: `📱 *Número:* ${number}\n\n¿Guardar? (responde "si" o "no")` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Número inválido. Debe tener al menos 8 dígitos.' });
+        }
+        return true;
+      } else {
+        pendingConfirmation = { type: 'add_mobile', step: 'awaiting_data' };
+        await sock.sendMessage(remoteJid, { text: '📱 Envíame el número de saldo móvil (solo dígitos).' });
+        return true;
+      }
     }
 
     if (plainLower.startsWith('ver tarjetas')) {
@@ -1023,6 +1101,38 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       }
       return true;
     }
+  }
+
+  // Confirmaciones generales
+  if (pendingConfirmation && pendingConfirmation.step === 'confirm') {
+    if (plainLower === 'si') {
+      if (pendingConfirmation.type === 'add_game') {
+        const result = await addGame(pendingConfirmation.gameName, pendingConfirmation.offers, ['ID']);
+        if (result) {
+          await sock.sendMessage(remoteJid, { text: `✅ Juego "${pendingConfirmation.gameName}" guardado con ${pendingConfirmation.offers.length} ofertas.` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Error al guardar en la base de datos.' });
+        }
+      } else if (pendingConfirmation.type === 'add_card') {
+        const result = await addCard(pendingConfirmation.cardName, pendingConfirmation.cardNumber);
+        if (result) {
+          await sock.sendMessage(remoteJid, { text: `✅ Tarjeta "${pendingConfirmation.cardName}" guardada.` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Error al guardar la tarjeta.' });
+        }
+      } else if (pendingConfirmation.type === 'add_mobile') {
+        const result = await addMobileNumber(pendingConfirmation.mobileNumber);
+        if (result) {
+          await sock.sendMessage(remoteJid, { text: `✅ Número ${pendingConfirmation.mobileNumber} guardado.` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Error al guardar el número.' });
+        }
+      }
+    } else {
+      await sock.sendMessage(remoteJid, { text: '❌ Operación cancelada.' });
+    }
+    pendingConfirmation = null;
+    return true;
   }
 
   // Completar pedido
@@ -1104,7 +1214,7 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
   if (session.step === 'awaiting_offers_selection') {
     const indices = messageText.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0);
     if (indices.length === 0) {
-      await sock.sendMessage(remoteJid, { text: "❌ Por favor, responde \"tarjeta\" o \"saldo\". (No me hagas repetir, que no soy disco rayado... aunque a veces me siento como un loop infinito de código)" });
+      await sock.sendMessage(remoteJid, { text: "❌ Por favor, responde con números válidos separados por coma. (Como la serie de números de la suerte... aunque no tengo suerte 😢)" });
       return true;
     }
     const offers = JSON.parse(session.game.offers || '[]');
@@ -1135,7 +1245,7 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
     const method = plainLower.includes('tarjeta') ? 'card' : (plainLower.includes('saldo') ? 'mobile' : null);
     if (!method) {
       await sock.sendMessage(remoteJid, { text: "❌ Por favor, responde \"tarjeta\" o \"saldo\". (No me hagas repetir, que no soy disco rayado... aunque a veces me siento como un loop infinito de código)" });
-      return saldo
+      return true;
     }
     session.paymentMethod = method;
     let total = 0;
@@ -1260,7 +1370,6 @@ async function handlePrivateAI(msg, participant, pushName, messageText, remoteJi
   const userMemory = await loadUserMemory(participant) || {};
   const isAdmin = isSameUser(participant, ADMIN_WHATSAPP_ID);
 
-  // Prompt especial para privado: mantener personalidad pero priorizar ventas
   const privatePrompt = `${DEFAULT_SYSTEM_PROMPT}\n\n**CONTEXTO ACTUAL:** Estás en un chat privado con un usuario. Tu función principal es ayudar con recargas, pero también puedes conversar de forma amigable. Si el usuario es admin (${isAdmin ? 'SÍ' : 'NO'}), puedes ejecutar comandos especiales cuando los detectes. Mantén tu personalidad, pero prioriza el tema de recargas.`;
 
   const now = new Date();
