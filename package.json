@@ -1,21 +1,21 @@
 {
-  "name": "shiro-synthesis-two-bot",
+  "name": "shiro-synthesis-two",
   "version": "1.0.0",
-  "description": "Bot de WhatsApp Shiro Synthesis Two (SST) con OpenRouter",
+  "description": "Bot de WhatsApp con sistema de ventas y moderación",
   "main": "sst-bot.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node sst-bot.js"
   },
-  "keywords": ["whatsapp","bot","openrouter","shiro","sst"],
-  "author": "Asche",
-  "license": "MIT",
   "dependencies": {
-    "@supabase/supabase-js": "^2.25.0",
-    "@whiskeysockets/baileys": "^6.6.0",
-    "axios": "^1.6.8",
+    "@supabase/supabase-js": "^2.39.0",
+    "@whiskeysockets/baileys": "^6.7.0",
+    "axios": "^1.6.2",
     "express": "^4.18.2",
-    "pino": "^8.15.0",
-    "qrcode": "^1.5.1"
+    "pino": "^8.17.0",
+    "qrcode": "^1.5.3",
+    "uuid": "^9.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
