@@ -1,8 +1,6 @@
 /**
  * sst-bot.js
- * Shiro Synthesis Two - Versión COMPLETA con sistema de ventas, webhooks y moderación.
- * 
- * TODO EN UN SOLO ARCHIVO.
+ * Shiro Synthesis Two - Versión COMPLETA con IA en privado, sistema de ventas, webhooks y moderación.
  */
 
 const {
@@ -28,19 +26,7 @@ const ADMIN_WHATSAPP_ID = process.env.ADMIN_WHATSAPP_ID || '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const TIMEZONE = process.env.TIMEZONE || 'America/Mexico_City';
 const ADMIN_PHONE_NUMBER = process.env.ADMIN_PHONE_NUMBER || '59190241';
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'mi-secreto-super-seguro';
-
-// Mapeo token -> tarjeta para Transfermóvil
-const TOKEN_TARJETA_MAP_JSON = process.env.TOKEN_TARJETA_MAP || "{}";
-const TOKEN_TARJETA_MAP = JSON.parse(TOKEN_TARJETA_MAP_JSON);
-
-// Mapeo tarjeta -> webhook destino para Transfermóvil
-const TARJETAS_WEBHOOKS_JSON = process.env.TARJETAS_WEBHOOKS || "{}";
-const TARJETAS_WEBHOOKS = JSON.parse(TARJETAS_WEBHOOKS_JSON);
-
-// Mapeo token -> webhook destino para Cubacel
-const TOKEN_WEBHOOK_MAP_JSON = process.env.TOKEN_WEBHOOK_MAP || "{}";
-const TOKEN_WEBHOOK_MAP = JSON.parse(TOKEN_WEBHOOK_MAP_JSON);
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || 'secretparserasche';
 
 // Modelos de OpenRouter
 const OPENROUTER_MODELS = process.env.OPENROUTER_MODEL
@@ -83,7 +69,11 @@ let lastActivity = Date.now();
 let lastNudgeTime = 0;
 let nudgeSent = false;
 let silentCooldownUntil = 0;
-let adminOnline = false; // Se actualiza con presencia
+let adminOnline = false;          // Detectado por presencia
+let adminPaused = false;          // Pausa manual para no atender pedidos
+let businessMode = false;         // Modo negocio para comandos de admin
+let adminTestMode = false;        // Modo prueba (admin como cliente)
+let pendingConfirmation = null;   // Para confirmaciones de admin
 
 // Estructuras en memoria (respaldo)
 let inMemoryWarnings = new Map();
@@ -96,6 +86,9 @@ let inMemoryBotConfig = {
   personalityTraits: {},
   allowPersonalityChanges: true
 };
+
+// Sesiones de clientes para flujo de ventas
+const userSessions = new Map();
 
 // ========== COLA INTELIGENTE ==========
 class SmartQueue {
@@ -208,7 +201,7 @@ const GOODBYE_PHRASES = [
   "@%s salió por la puerta de atrás. Literalmente."
 ];
 
-// ========== PROMPT BASE (FIJO EN CÓDIGO) - VERSIÓN EXTENDIDA PLUS ==========
+// ========== PROMPT BASE (EXTENDIDO) ==========
 const DEFAULT_SYSTEM_PROMPT = `
 Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime joven (aparentas menos de 20 años), pero con una personalidad compleja y un trasfondo dramático.
 
@@ -303,6 +296,9 @@ Además, para la gestión de ventas, el admin puede usar los siguientes comandos
 - **Ver saldos** – Lista los números de saldo.
 - **Eliminar tarjeta/saldo** – Seguido del nombre o número.
 - **Admin usuario** – Activa un modo de prueba donde el admin es tratado como un cliente normal para probar el flujo de compra. Al final, la solicitud se enviará al admin (a ti mismo) para completar.
+- **shiro pausa** – Pausa la atención de nuevos pedidos (el grupo sigue normal).
+- **shiro reanudar** – Reactiva la atención.
+- **shiro estado** – Muestra el estado actual (online, pausa, disponible).
 
 Siempre debes confirmar las acciones importantes con un "¿Estás seguro?" y esperar "Si" o "No".
 
@@ -459,175 +455,120 @@ function getMessageSeverity(text) {
   return severity;
 }
 
-// ========== FUNCIONES DE ACCESO A SUPABASE (PERSISTENCIA) ==========
-// Las funciones existentes (warnings, user_memory, responded_messages, suggestions, bot_config) se mantienen igual.
-// Aquí van todas (copiadas del código original):
-
+// ========== FUNCIONES DE ACCESO A SUPABASE ==========
 async function getUserWarnings(participant) {
-  if (supabaseClient) {
-    const { data, error } = await supabaseClient
-      .from('warnings')
-      .select('count')
-      .eq('participant', participant)
-      .maybeSingle();
-    if (error) { console.error('Error fetching warnings:', error.message); return 0; }
-    return data?.count || 0;
-  } else {
-    return inMemoryWarnings.get(participant)?.count || 0;
-  }
+  const { data, error } = await supabaseClient
+    .from('warnings')
+    .select('count')
+    .eq('participant', participant)
+    .maybeSingle();
+  if (error) { console.error('Error fetching warnings:', error.message); return 0; }
+  return data?.count || 0;
 }
 
 async function incrementUserWarnings(participant) {
   const newCount = (await getUserWarnings(participant)) + 1;
-  if (supabaseClient) {
-    await supabaseClient
-      .from('warnings')
-      .upsert({ participant, count: newCount, updated_at: new Date() }, { onConflict: 'participant' });
-  } else {
-    inMemoryWarnings.set(participant, { count: newCount, lastWarning: Date.now() });
-  }
+  await supabaseClient
+    .from('warnings')
+    .upsert({ participant, count: newCount, updated_at: new Date() }, { onConflict: 'participant' });
   return newCount;
 }
 
 async function resetUserWarnings(participant) {
-  if (supabaseClient) {
-    await supabaseClient.from('warnings').delete().eq('participant', participant);
-  } else {
-    inMemoryWarnings.delete(participant);
-  }
+  await supabaseClient.from('warnings').delete().eq('participant', participant);
 }
 
 async function getRespondedMessages(participant, hours = RESPONSE_MEMORY_HOURS) {
   const since = Date.now() - hours * 3600 * 1000;
-  if (supabaseClient) {
-    const { data, error } = await supabaseClient
-      .from('responded_messages')
-      .select('message_text, response_text')
-      .eq('participant', participant)
-      .gte('timestamp', new Date(since).toISOString());
-    if (error) { console.error('Error fetching responded messages:', error.message); return []; }
-    return data;
-  } else {
-    const records = inMemoryRespondedMessages.get(participant) || [];
-    return records.filter(r => r.timestamp > since);
-  }
+  const { data, error } = await supabaseClient
+    .from('responded_messages')
+    .select('message_text, response_text')
+    .eq('participant', participant)
+    .gte('timestamp', new Date(since).toISOString());
+  if (error) { console.error('Error fetching responded messages:', error.message); return []; }
+  return data;
 }
 
 async function addRespondedMessage(participant, messageText, responseText) {
-  if (supabaseClient) {
-    await supabaseClient
-      .from('responded_messages')
-      .insert({ participant, message_text: messageText, response_text: responseText, timestamp: new Date() });
-  } else {
-    const records = inMemoryRespondedMessages.get(participant) || [];
-    records.push({ text: messageText, response: responseText, timestamp: Date.now() });
-    if (records.length > 50) records.shift();
-    inMemoryRespondedMessages.set(participant, records);
-  }
+  await supabaseClient
+    .from('responded_messages')
+    .insert({ participant, message_text: messageText, response_text: responseText, timestamp: new Date() });
 }
 
 async function saveUserMemory(participant, data) {
-  if (supabaseClient) {
-    await supabaseClient
-      .from('user_memory')
-      .upsert({ participant, data, updated_at: new Date() }, { onConflict: 'participant' });
-  } else {
-    inMemoryUserMemory.set(participant, { data, updated: Date.now() });
-  }
+  await supabaseClient
+    .from('user_memory')
+    .upsert({ participant, data, updated_at: new Date() }, { onConflict: 'participant' });
 }
 
 async function loadUserMemory(participant) {
-  if (supabaseClient) {
-    const { data, error } = await supabaseClient
-      .from('user_memory')
-      .select('data')
-      .eq('participant', participant)
-      .maybeSingle();
-    if (error) { console.error('Error loading user memory:', error.message); return null; }
-    return data?.data || null;
-  } else {
-    return inMemoryUserMemory.get(participant)?.data || null;
-  }
+  const { data, error } = await supabaseClient
+    .from('user_memory')
+    .select('data')
+    .eq('participant', participant)
+    .maybeSingle();
+  if (error) { console.error('Error loading user memory:', error.message); return null; }
+  return data?.data || null;
 }
 
 async function saveSuggestion(participant, pushName, text, isPositive) {
-  if (supabaseClient) {
-    await supabaseClient
-      .from('suggestions')
-      .insert({ participant, name: pushName, text, is_positive: isPositive, reviewed: false, timestamp: new Date() });
-  } else {
-    inMemorySuggestions.push({ participant, name: pushName, text, isPositive, reviewed: false, timestamp: Date.now() });
-  }
+  await supabaseClient
+    .from('suggestions')
+    .insert({ participant, name: pushName, text, is_positive: isPositive, reviewed: false, timestamp: new Date() });
 }
 
 async function getUnreviewedSuggestions() {
-  if (supabaseClient) {
-    const { data, error } = await supabaseClient
-      .from('suggestions')
-      .select('*')
-      .eq('reviewed', false)
-      .order('timestamp', { ascending: true });
-    if (error) { console.error('Error fetching suggestions:', error.message); return []; }
-    return data;
-  } else {
-    return inMemorySuggestions.filter(s => !s.reviewed);
-  }
+  const { data, error } = await supabaseClient
+    .from('suggestions')
+    .select('*')
+    .eq('reviewed', false)
+    .order('timestamp', { ascending: true });
+  if (error) { console.error('Error fetching suggestions:', error.message); return []; }
+  return data;
 }
 
 async function markSuggestionsReviewed(ids) {
-  if (supabaseClient) {
-    await supabaseClient.from('suggestions').update({ reviewed: true }).in('id', ids);
-  } else {
-    inMemorySuggestions.forEach(s => { if (ids.includes(s.id)) s.reviewed = true; });
-  }
+  await supabaseClient.from('suggestions').update({ reviewed: true }).in('id', ids);
 }
 
 async function loadBotConfig() {
-  if (supabaseClient) {
-    const { data, error } = await supabaseClient
-      .from('bot_config')
-      .select('*')
-      .eq('key', 'main')
-      .maybeSingle();
-    if (error) {
-      console.error('Error loading bot config:', error.message);
-      return { personalityTraits: {}, allowPersonalityChanges: true };
-    }
-    if (data) {
-      return {
-        personalityTraits: data.personality_traits || {},
-        allowPersonalityChanges: data.allow_personality_changes !== false
-      };
-    } else {
-      await supabaseClient.from('bot_config').insert({
-        key: 'main',
-        personality_traits: {},
-        allow_personality_changes: true,
-        updated_at: new Date()
-      });
-      return { personalityTraits: {}, allowPersonalityChanges: true };
-    }
+  const { data, error } = await supabaseClient
+    .from('bot_config')
+    .select('*')
+    .eq('key', 'main')
+    .maybeSingle();
+  if (error) {
+    console.error('Error loading bot config:', error.message);
+    return { personalityTraits: {}, allowPersonalityChanges: true };
+  }
+  if (data) {
+    return {
+      personalityTraits: data.personality_traits || {},
+      allowPersonalityChanges: data.allow_personality_changes !== false
+    };
   } else {
-    return inMemoryBotConfig;
+    await supabaseClient.from('bot_config').insert({
+      key: 'main',
+      personality_traits: {},
+      allow_personality_changes: true,
+      updated_at: new Date()
+    });
+    return { personalityTraits: {}, allowPersonalityChanges: true };
   }
 }
 
 async function saveBotConfig(config) {
-  if (supabaseClient) {
-    await supabaseClient
-      .from('bot_config')
-      .upsert({
-        key: 'main',
-        personality_traits: config.personalityTraits,
-        allow_personality_changes: config.allowPersonalityChanges,
-        updated_at: new Date()
-      }, { onConflict: 'key' });
-  } else {
-    inMemoryBotConfig = { ...inMemoryBotConfig, ...config };
-  }
+  await supabaseClient
+    .from('bot_config')
+    .upsert({
+      key: 'main',
+      personality_traits: config.personalityTraits,
+      allow_personality_changes: config.allowPersonalityChanges,
+      updated_at: new Date()
+    }, { onConflict: 'key' });
 }
 
-// ========== NUEVAS FUNCIONES PARA VENTAS ==========
+// ========== FUNCIONES DE NEGOCIO ==========
 async function getGames() {
   const { data, error } = await supabaseClient
     .from('games')
@@ -825,36 +766,6 @@ async function getPendingOrders() {
 
 // ========== AUTENTICACIÓN SUPABASE (AUTH SESSIONS) ==========
 const useSupabaseAuthState = async () => {
-  if (!supabaseClient) {
-    console.warn('⚠️ Usando credenciales en memoria (no persistente)');
-    const creds = initAuthCreds();
-    const storeKeys = {};
-    return {
-      state: {
-        creds,
-        keys: {
-          get: async (type, ids) => {
-            const data = {};
-            for (const id of ids) {
-              const key = `${type}-${id}`;
-              if (storeKeys[key]) data[id] = storeKeys[key];
-            }
-            return data;
-          },
-          set: async (data) => {
-            for (const category in data) {
-              for (const id in data[category]) {
-                const key = `${category}-${id}`;
-                storeKeys[key] = data[category][id];
-              }
-            }
-          }
-        }
-      },
-      saveCreds: async () => {}
-    };
-  }
-
   const writeData = async (data, key) => {
     try {
       await supabaseClient.from('auth_sessions').upsert({ key, value: JSON.stringify(data, BufferJSON.replacer) });
@@ -977,16 +888,30 @@ function startSilenceChecker() {
   }, 60 * 1000);
 }
 
-// ========== VARIABLES PARA EL FLUJO DE VENTAS ==========
-let businessMode = false;
-let adminTestMode = false;
-let pendingConfirmation = null; // Para confirmaciones de admin
-const userSessions = new Map(); // Para clientes en privado
-
-// ========== MANEJO DE COMANDOS DE ADMIN EN PRIVADO ==========
+// ========== COMANDOS DE ADMIN ==========
 async function handleAdminCommand(msg, participant, pushName, messageText, remoteJid) {
   const plainLower = messageText.toLowerCase().trim();
 
+  // Comandos de pausa/estado
+  if (plainLower === 'shiro pausa') {
+    adminPaused = true;
+    await sock.sendMessage(remoteJid, { text: '⏸️ Modo pausa activado. No se atenderán nuevos pedidos en privado. El grupo sigue normal.' });
+    return true;
+  }
+
+  if (plainLower === 'shiro reanudar') {
+    adminPaused = false;
+    await sock.sendMessage(remoteJid, { text: '▶️ Modo pausa desactivado. Ya puedo atender pedidos normalmente.' });
+    return true;
+  }
+
+  if (plainLower === 'shiro estado') {
+    const estado = `Admin online: ${adminOnline ? '✅' : '❌'}\nPausa manual: ${adminPaused ? '⏸️' : '▶️'}\nDisponible para pedidos: ${(adminOnline && !adminPaused) ? '✅' : '❌'}`;
+    await sock.sendMessage(remoteJid, { text: estado });
+    return true;
+  }
+
+  // Modo negocio
   if (plainLower === '!modo recarga') {
     businessMode = true;
     await sock.sendMessage(remoteJid, { text: '✅ Modo negocio activado. Puedes añadir o editar productos.' });
@@ -1092,7 +1017,7 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
     }
   }
 
-  // Comando para marcar pedido como completado
+  // Completar pedido
   const match = plainLower.match(/shiro,\s*id:\s*([a-f0-9-]+)\s+(completada|lista|hecho|ok)/i);
   if (match) {
     const orderId = match[1];
@@ -1113,13 +1038,10 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
   return false;
 }
 
-// ========== FLUJO DE ATENCIÓN AL CLIENTE EN PRIVADO ==========
+// ========== FLUJO DE VENTAS PARA CLIENTES ==========
 async function handlePrivateCustomer(msg, participant, pushName, messageText, remoteJid) {
   const plainLower = messageText.toLowerCase().trim();
   let session = userSessions.get(participant) || { step: 'initial' };
-
-  // Si es admin en modo prueba, lo tratamos como cliente
-  const isAdminTest = adminTestMode && isSameUser(participant, ADMIN_WHATSAPP_ID);
 
   if (session.step === 'initial') {
     const greeting = `¡Hola ${pushName || 'cliente'}! 😊 Soy Shiro, la asistente virtual de recargas. *Este chat es exclusivamente para realizar compras.* ¿En qué juego o producto puedo ayudarte? (Puedes pedir el catálogo con "catálogo")`;
@@ -1230,7 +1152,8 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
     session.step = 'confirm_payment';
     userSessions.set(participant, session);
 
-    if (!adminOnline) {
+    const adminAvailable = adminOnline && !adminPaused;
+    if (!adminAvailable) {
       await sock.sendMessage(remoteJid, { text: '⏳ El administrador no está disponible en este momento. Puedes dejar tu pedido y se procesará cuando él se conecte. ¿Quieres continuar? (Responde "si" para dejar el pedido en espera o "no" para cancelar)' });
       session.step = 'awaiting_offline_confirmation';
       return true;
@@ -1324,9 +1247,101 @@ async function notifyAdminNewOrder(order, session) {
   await sock.sendMessage(adminJid, { text: message });
 }
 
-// ========== WEBHOOK PARA NOTIFICACIONES DE PAGO ==========
+// ========== IA PARA PRIVADO (CONVERSACIÓN LIBRE) ==========
+async function handlePrivateAI(msg, participant, pushName, messageText, remoteJid) {
+  const userMemory = await loadUserMemory(participant) || {};
+  const isAdmin = isSameUser(participant, ADMIN_WHATSAPP_ID);
+
+  // Prompt especial para privado: mantener personalidad pero priorizar ventas
+  const privatePrompt = `${DEFAULT_SYSTEM_PROMPT}\n\n**CONTEXTO ACTUAL:** Estás en un chat privado con un usuario. Tu función principal es ayudar con recargas, pero también puedes conversar de forma amigable. Si el usuario es admin (${isAdmin ? 'SÍ' : 'NO'}), puedes ejecutar comandos especiales cuando los detectes. Mantén tu personalidad, pero prioriza el tema de recargas.`;
+
+  const now = new Date();
+  const dateStr = now.toLocaleString('es-ES', { timeZone: TIMEZONE, dateStyle: 'full', timeStyle: 'short' });
+  const timePeriod = getCurrentTimeBasedState();
+  const systemPromptWithTime = `${privatePrompt}\n\nFecha y hora actual: ${dateStr} (${timePeriod}).`;
+
+  const messagesForAI = [
+    { role: 'system', content: systemPromptWithTime },
+    { role: 'user', content: `${pushName || 'Usuario'}: ${messageText}` }
+  ];
+
+  const aiResp = await callOpenRouterWithFallback(messagesForAI);
+
+  if (aiResp && aiResp.trim().toUpperCase() === 'SKIP') return;
+
+  let replyText = aiResp || '😅 No pude procesar eso ahora. ¿Puedes repetirlo?';
+  replyText = sanitizeAI(replyText);
+  replyText = maybeAddStateToResponse(replyText, userMemory.lastState);
+
+  userMemory.lastState = getCurrentTimeBasedState();
+  await saveUserMemory(participant, userMemory);
+
+  await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
+
+  messageHistory.push({ id: `bot-${Date.now()}`, participant: 'bot', pushName: 'Shiro', text: replyText, timestamp: Date.now(), isBot: true });
+  if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
+}
+
+// ========== LLAMADA A OPENROUTER ==========
+async function callOpenRouterWithFallback(messages) {
+  for (const model of OPENROUTER_MODELS) {
+    try {
+      console.log(`Intentando modelo: ${model}`);
+      const payload = { model, messages };
+      const res = await axios.post('https://openrouter.ai/api/v1/chat/completions', payload, {
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://github.com/tuapp',
+          'X-Title': 'SST-Bot'
+        },
+        timeout: 30000
+      });
+      if (res.status === 200) {
+        const choice = res.data?.choices?.[0];
+        const content = choice?.message?.content ?? choice?.message ?? choice?.text ?? null;
+        if (content) {
+          console.log(`✅ Respuesta obtenida con modelo: ${model}`);
+          return sanitizeAI(String(content));
+        }
+      }
+    } catch (err) {
+      console.warn(`Modelo ${model} falló:`, err?.response?.data?.error?.message || err.message);
+    }
+  }
+  console.error('❌ Todos los modelos fallaron');
+  return null;
+}
+
+// ========== PROCESAR PEDIDOS OFFLINE ==========
+async function processPendingOfflineOrders() {
+  const { data, error } = await supabaseClient
+    .from('orders')
+    .select('*')
+    .eq('status', 'waiting_admin_online');
+  if (error) return;
+  for (const order of data) {
+    await sock.sendMessage(ADMIN_WHATSAPP_ID, { text: `⏳ Hay pedidos pendientes de cuando estabas offline. Revisa la base de datos.` });
+    await updateOrderStatus(order.id, 'pending');
+    const clientJid = `${order.client_phone}@s.whatsapp.net`;
+    await sock.sendMessage(clientJid, { text: `🔄 El admin ya está online. Tu pedido ${order.id} será procesado.` });
+  }
+}
+
+// ========== SERVIDOR WEB Y WEBHOOK ==========
 const app = express();
 app.use(express.json());
+
+app.get('/', (req, res) => res.send('Shiro Synthesis Two - Bot Activo 🤖'));
+app.get('/qr', async (req, res) => {
+  if (!latestQR) return res.send('<p>Bot ya conectado o generando QR... refresca en 10s.</p>');
+  try {
+    const qrImage = await QRCode.toDataURL(latestQR);
+    res.send(`<img src="${qrImage}" />`);
+  } catch (err) {
+    res.status(500).send('Error QR');
+  }
+});
 
 app.post('/webhook/:token', async (req, res) => {
   const token = req.params.token;
@@ -1364,8 +1379,6 @@ app.post('/webhook/:token', async (req, res) => {
     res.status(400).json({ error: 'Tipo de pago no soportado' });
   }
 });
-// ========== ACTUALIZACIÓN DE PRESENCIA (ONLINE/OFFLINE) ==========
-// Nota: Esto debe ir después de crear sock, pero como el evento se configura dentro de startBot, lo pondremos allí.
 
 // ========== INICIAR BOT ==========
 async function startBot() {
@@ -1406,7 +1419,7 @@ async function startBot() {
     }
   });
 
-  // Evento de nuevos participantes (bienvenida con mención)
+  // Evento de nuevos participantes (bienvenida)
   sock.ev.on('group-participants.update', async (update) => {
     try {
       const { id, participants, action } = update;
@@ -1432,7 +1445,7 @@ async function startBot() {
     } catch (e) { console.error('Welcome/Goodbye error', e); }
   });
 
-  // Evento de presencia (para detectar online del admin)
+  // Evento de presencia (admin online)
   sock.ev.on('presence.update', ({ id, presences }) => {
     if (id === ADMIN_WHATSAPP_ID) {
       const presence = presences[id];
@@ -1479,31 +1492,29 @@ async function startBot() {
           if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
         }
 
-        // ===== RESPUESTA A PRIVADOS =====
+        // ===== MANEJO DE MENSAJES PRIVADOS =====
         if (isPrivateChat) {
+          // 1. Para admin: intentar comandos primero
           if (isAdmin) {
-            // Primero probar comandos de admin
-            const handled = await handleAdminCommand(msg, participant, pushName, messageText, remoteJid);
-            if (handled) continue;
-            // Si es admin en modo prueba, puede ser tratado como cliente
-            if (adminTestMode) {
-              const handledCustomer = await handlePrivateCustomer(msg, participant, pushName, messageText, remoteJid);
-              if (handledCustomer) continue;
-            }
-            // Si no, conversación normal con IA
-          } else {
-            // Cliente normal en privado
-            const handled = await handlePrivateCustomer(msg, participant, pushName, messageText, remoteJid);
-            if (handled) continue;
-            // Si no se pudo manejar, redirigir
-            await sock.sendMessage(remoteJid, { text: '🤖 Este chat es solo para recargas. Por favor, indícame qué juego deseas o escribe "catálogo".' });
-            continue;
+            const handledCommand = await handleAdminCommand(msg, participant, pushName, messageText, remoteJid);
+            if (handledCommand) continue;
           }
+
+          // 2. Intentar flujo de ventas (para admin en modo prueba o cliente normal)
+          const shouldRunSalesFlow = (!isAdmin) || (isAdmin && adminTestMode);
+          if (shouldRunSalesFlow) {
+            const handledSales = await handlePrivateCustomer(msg, participant, pushName, messageText, remoteJid);
+            if (handledSales) continue;
+          }
+
+          // 3. Si nada de lo anterior aplica, usar IA con prompt especial para privado
+          await handlePrivateAI(msg, participant, pushName, messageText, remoteJid);
+          continue;
         }
 
         if (!isTargetGroup) continue;
 
-        // ===== MODERACIÓN Y MANEJO EN GRUPO (código existente) =====
+        // ===== MODERACIÓN EN GRUPO (código existente) =====
         if (!isAdmin) {
           const severity = getMessageSeverity(messageText);
           if (severity >= 2) {
@@ -1625,10 +1636,7 @@ async function startBot() {
 
           const aiResp = await callOpenRouterWithFallback(messagesForAI);
 
-          if (aiResp && aiResp.trim().toUpperCase() === 'SKIP') {
-            console.log('IA decidió no responder (SKIP)');
-            return;
-          }
+          if (aiResp && aiResp.trim().toUpperCase() === 'SKIP') return;
 
           let replyText = aiResp || 'Lo siento, ahora mismo no puedo pensar bien 😅. Pregúntale al admin si es urgente.';
           replyText = replyText.replace(/^\s*Shiro:\s*/i, '');
@@ -1675,65 +1683,6 @@ async function startBot() {
     }
   });
 }
-
-// ========== FUNCIÓN PARA LLAMAR A OPENROUTER ==========
-async function callOpenRouterWithFallback(messages) {
-  for (const model of OPENROUTER_MODELS) {
-    try {
-      console.log(`Intentando modelo: ${model}`);
-      const payload = { model, messages };
-      const res = await axios.post('https://openrouter.ai/api/v1/chat/completions', payload, {
-        headers: {
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://github.com/tuapp',
-          'X-Title': 'SST-Bot'
-        },
-        timeout: 30000
-      });
-      if (res.status === 200) {
-        const choice = res.data?.choices?.[0];
-        const content = choice?.message?.content ?? choice?.message ?? choice?.text ?? null;
-        if (content) {
-          console.log(`✅ Respuesta obtenida con modelo: ${model}`);
-          return sanitizeAI(String(content));
-        }
-      }
-    } catch (err) {
-      console.warn(`Modelo ${model} falló:`, err?.response?.data?.error?.message || err.message);
-    }
-  }
-  console.error('❌ Todos los modelos fallaron');
-  return null;
-}
-
-// ========== PROCESAR PEDIDOS OFFLINE ==========
-async function processPendingOfflineOrders() {
-  const { data, error } = await supabaseClient
-    .from('orders')
-    .select('*')
-    .eq('status', 'waiting_admin_online');
-  if (error) return;
-  for (const order of data) {
-    await sock.sendMessage(ADMIN_WHATSAPP_ID, { text: `⏳ Hay pedidos pendientes de cuando estabas offline. Revisa la base de datos.` });
-    await updateOrderStatus(order.id, 'pending');
-    const clientJid = `${order.client_phone}@s.whatsapp.net`;
-    await sock.sendMessage(clientJid, { text: `🔄 El admin ya está online. Tu pedido ${order.id} será procesado.` });
-  }
-}
-
-// ========== SERVIDOR WEB ==========
-app.get('/', (req, res) => res.send('Shiro Synthesis Two - Bot Activo 🤖'));
-app.get('/qr', async (req, res) => {
-  if (!latestQR) return res.send('<p>Bot ya conectado o generando QR... refresca en 10s.</p>');
-  try {
-    const qrImage = await QRCode.toDataURL(latestQR);
-    res.send(`<img src="${qrImage}" />`);
-  } catch (err) {
-    res.status(500).send('Error QR');
-  }
-});
-app.listen(PORT, () => console.log(`🌐 Servidor web en puerto ${PORT}`));
 
 // ========== GRACEFUL SHUTDOWN ==========
 process.on('SIGINT', () => { console.log('SIGINT recibido. Cerrando...'); process.exit(0); });
