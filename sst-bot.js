@@ -1,17 +1,15 @@
 /**
  * sst-bot.js
- * Shiro Synthesis Two - Versión COMPLETA con todos los comandos, gestión de campos, edición/eliminación y correcciones de respuesta.
+ * Shiro Synthesis Two - Versión COMPLETA y DEFINITIVA
  * 
  * CARACTERÍSTICAS:
- * - Personalidad extendida, atrevida y con cultura friki.
- * - Gestión de juegos: nombre, texto de ofertas, campos requeridos (ID, servidor, etc.).
- * - Comandos completos: añadir, editar, eliminar juegos, tarjetas, saldos.
- * - Comando !comandos para admin.
- * - Flujo de ventas en privado con cálculo de total mediante IA.
- * - Moderación en grupo, nudges, bienvenidas/despedidas.
- * - Corrección: ahora responde siempre a menciones directas y preguntas en grupo.
- * - Memoria persistente en Supabase.
- * - Servidor web independiente (QR y webhook).
+ * - Personalidad extendida con drama y cultura friki.
+ * - Gestión completa de juegos, tarjetas y saldos (añadir, editar, eliminar).
+ * - Parseo automático de ofertas para cálculo de totales.
+ * - Flujo de ventas para clientes en privado.
+ * - Moderación en grupo (enlaces, política, ofertas, etc.).
+ * - Webhook para confirmación de pagos.
+ * - Servidor web independiente para QR.
  */
 
 const {
@@ -53,7 +51,7 @@ const SPONTANEOUS_CHANCE = 0.4;
 const LONG_MESSAGE_THRESHOLD = 100;
 const DUPLICATE_MESSAGE_WINDOW = 5 * 60 * 1000;
 const SIMILARITY_THRESHOLD = 0.6;
-const USER_COOLDOWN_MS = 2000; // Reducido a 2 segundos para ser más receptivo
+const USER_COOLDOWN_MS = 2000;
 
 // ========== VALIDACIÓN DE API KEY ==========
 if (!OPENROUTER_API_KEY) {
@@ -84,9 +82,9 @@ let adminOnline = false;
 let adminPaused = false;
 let businessMode = false;
 let adminTestMode = false;
-let pendingConfirmation = null; // Para flujos de admin de varios pasos
+let pendingConfirmation = null;
 
-// Estructuras en memoria (respaldo)
+// Estructuras en memoria (respaldo para Supabase)
 let inMemoryWarnings = new Map();
 let inMemoryUserMemory = new Map();
 let inMemoryRespondedMessages = new Map();
@@ -98,7 +96,6 @@ let inMemoryBotConfig = {
   allowPersonalityChanges: true
 };
 
-// Sesiones de clientes para flujo de ventas
 const userSessions = new Map();
 
 // ========== COLA INTELIGENTE ==========
@@ -334,6 +331,7 @@ Ejemplos de tono:
 "No manches, eso sí que no lo sabía 🤔"
 ...
 `;
+
 // ========== FUNCIONES AUXILIARES ==========
 function sanitizeAI(text) {
   if (!text) return '';
@@ -400,7 +398,6 @@ async function isSimilarToPrevious(participant, messageText) {
 }
 
 function canRespondToUser(participant) {
-  // Solo aplica cooldown a no admins
   if (isSameUser(participant, ADMIN_WHATSAPP_ID)) return true;
   const lastTime = inMemoryLastResponseTime.get(participant) || 0;
   const now = Date.now();
@@ -829,7 +826,24 @@ async function getPendingOrders() {
   return data;
 }
 
-// ========== AUTENTICACIÓN SUPABASE (AUTH SESSIONS) ==========
+// ========== PARSEO DE OFERTAS ==========
+function parseOffersText(offersText) {
+  const lines = offersText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const offers = [];
+  for (const line of lines) {
+    const match = line.match(/^(.+?)\s*☞\s*(\d+)\s*💳\s*\|\s*☞\s*(\d+)\s*📲/);
+    if (match) {
+      offers.push({
+        name: match[1].trim(),
+        card_price: parseInt(match[2]),
+        mobile_price: parseInt(match[3])
+      });
+    }
+  }
+  return offers;
+}
+
+// ========== AUTENTICACIÓN SUPABASE ==========
 const useSupabaseAuthState = async () => {
   const writeData = async (data, key) => {
     try {
@@ -878,8 +892,8 @@ const useSupabaseAuthState = async () => {
   };
 };
 
-// ========== CHECKER DE SILENCIO (NUDGES) ==========
-const SILENCE_THRESHOLD = 1000 * 60 * 60; // 60 minutos
+// ========== CHECKER DE SILENCIO ==========
+const SILENCE_THRESHOLD = 1000 * 60 * 60;
 const RESPONSE_WINDOW_AFTER_NUDGE = 1000 * 60 * 10;
 const MIN_COOLDOWN = 1000 * 60 * 60 * 2;
 const MAX_COOLDOWN = 1000 * 60 * 60 * 3;
@@ -957,7 +971,210 @@ function startSilenceChecker() {
 async function handleAdminCommand(msg, participant, pushName, messageText, remoteJid) {
   const plainLower = messageText.toLowerCase().trim();
 
-  // Comando !comandos (siempre disponible)
+  // Primero manejar cualquier confirmación pendiente (flujos de varios pasos)
+  if (pendingConfirmation) {
+    // Flujo de añadir juego
+    if (pendingConfirmation.type === 'add_game') {
+      if (pendingConfirmation.step === 'awaiting_name') {
+        pendingConfirmation.gameName = messageText.trim();
+        pendingConfirmation.step = 'awaiting_offers';
+        await sock.sendMessage(remoteJid, { text: `📝 Ahora envía el texto de las ofertas para "${pendingConfirmation.gameName}" (tal cual quieres que se vea).` });
+        return true;
+      } else if (pendingConfirmation.step === 'awaiting_offers') {
+        pendingConfirmation.offersText = messageText;
+        pendingConfirmation.step = 'awaiting_fields';
+        await sock.sendMessage(remoteJid, { text: `📝 Ahora envía los campos requeridos separados por coma (ej: "ID, Servidor, Nick"). Por defecto solo "ID".` });
+        return true;
+      } else if (pendingConfirmation.step === 'awaiting_fields') {
+        const fields = messageText.split(',').map(f => f.trim()).filter(f => f.length > 0);
+        pendingConfirmation.requiredFields = fields.length ? fields : ['ID'];
+        pendingConfirmation.step = 'confirm';
+        await sock.sendMessage(remoteJid, { text: `📦 *Juego:* ${pendingConfirmation.gameName}\n*Ofertas:*\n${pendingConfirmation.offersText.substring(0, 200)}${pendingConfirmation.offersText.length > 200 ? '...' : ''}\n*Campos:* ${pendingConfirmation.requiredFields.join(', ')}\n\n¿Guardar? (responde "si" o "no")` });
+        return true;
+      }
+    }
+
+    // Flujo de añadir tarjeta
+    if (pendingConfirmation.type === 'add_card') {
+      if (pendingConfirmation.step === 'awaiting_name') {
+        pendingConfirmation.cardName = messageText.trim();
+        pendingConfirmation.step = 'awaiting_number';
+        await sock.sendMessage(remoteJid, { text: '💳 Ahora envía el número de la tarjeta:' });
+        return true;
+      } else if (pendingConfirmation.step === 'awaiting_number') {
+        pendingConfirmation.cardNumber = messageText.trim();
+        pendingConfirmation.step = 'confirm';
+        await sock.sendMessage(remoteJid, { text: `💳 *Tarjeta:* ${pendingConfirmation.cardName}\n*Número:* ${pendingConfirmation.cardNumber}\n\n¿Guardar? (responde "si" o "no")` });
+        return true;
+      }
+    }
+
+    // Flujo de añadir saldo
+    if (pendingConfirmation.type === 'add_mobile') {
+      if (pendingConfirmation.step === 'awaiting_number') {
+        const number = messageText.replace(/\s/g, '');
+        if (/^\d{8,}$/.test(number)) {
+          pendingConfirmation.mobileNumber = number;
+          pendingConfirmation.step = 'confirm';
+          await sock.sendMessage(remoteJid, { text: `📱 *Número:* ${number}\n\n¿Guardar? (responde "si" o "no")` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Número inválido. Debe tener al menos 8 dígitos.' });
+        }
+        return true;
+      }
+    }
+
+    // Editar juego
+    if (pendingConfirmation.type === 'edit_game') {
+      if (pendingConfirmation.step === 'awaiting_field') {
+        if (plainLower === 'nombre') {
+          pendingConfirmation.editField = 'name';
+          pendingConfirmation.step = 'awaiting_new_value';
+          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo nombre:' });
+          return true;
+        } else if (plainLower === 'ofertas') {
+          pendingConfirmation.editField = 'offers_text';
+          pendingConfirmation.step = 'awaiting_new_value';
+          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo texto de ofertas:' });
+          return true;
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Opción no válida. Responde "nombre" o "ofertas".' });
+          return true;
+        }
+      } else if (pendingConfirmation.step === 'awaiting_new_value') {
+        const updates = {};
+        updates[pendingConfirmation.editField] = messageText;
+        const success = await updateGame(pendingConfirmation.gameId, updates);
+        if (success) {
+          await sock.sendMessage(remoteJid, { text: `✅ Juego actualizado.` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
+        }
+        pendingConfirmation = null;
+        return true;
+      }
+    }
+
+    // Editar campos
+    if (pendingConfirmation.type === 'edit_fields' && pendingConfirmation.step === 'awaiting_fields') {
+      const fields = messageText.split(',').map(f => f.trim()).filter(f => f.length > 0);
+      if (fields.length === 0) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes enviar al menos un campo.' });
+        return true;
+      }
+      const success = await updateGame(pendingConfirmation.gameId, { required_fields: fields });
+      if (success) {
+        await sock.sendMessage(remoteJid, { text: `✅ Campos actualizados: ${fields.join(', ')}` });
+      } else {
+        await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
+      }
+      pendingConfirmation = null;
+      return true;
+    }
+
+    // Editar tarjeta
+    if (pendingConfirmation.type === 'edit_card') {
+      if (pendingConfirmation.step === 'awaiting_field') {
+        if (plainLower === 'nombre') {
+          pendingConfirmation.editField = 'name';
+          pendingConfirmation.step = 'awaiting_new_value';
+          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo nombre:' });
+          return true;
+        } else if (plainLower === 'número') {
+          pendingConfirmation.editField = 'number';
+          pendingConfirmation.step = 'awaiting_new_value';
+          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo número:' });
+          return true;
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Opción no válida. Responde "nombre" o "número".' });
+          return true;
+        }
+      } else if (pendingConfirmation.step === 'awaiting_new_value') {
+        const updates = {};
+        updates[pendingConfirmation.editField] = messageText;
+        const success = await updateCard(pendingConfirmation.cardId, updates);
+        if (success) {
+          await sock.sendMessage(remoteJid, { text: `✅ Tarjeta actualizada.` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
+        }
+        pendingConfirmation = null;
+        return true;
+      }
+    }
+
+    // Editar saldo
+    if (pendingConfirmation.type === 'edit_mobile' && pendingConfirmation.step === 'awaiting_new') {
+      const newNumber = messageText.replace(/\s/g, '');
+      if (!/^\d{8,}$/.test(newNumber)) {
+        await sock.sendMessage(remoteJid, { text: '❌ Número inválido. Debe tener al menos 8 dígitos.' });
+        return true;
+      }
+      const success = await updateMobileNumber(pendingConfirmation.mobileId, { number: newNumber });
+      if (success) {
+        await sock.sendMessage(remoteJid, { text: `✅ Número actualizado a ${newNumber}.` });
+      } else {
+        await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
+      }
+      pendingConfirmation = null;
+      return true;
+    }
+
+    // Confirmaciones finales (si/no)
+    if (pendingConfirmation.step === 'confirm') {
+      if (plainLower === 'si') {
+        if (pendingConfirmation.type === 'add_game') {
+          const result = await addGame(pendingConfirmation.gameName, pendingConfirmation.offersText, pendingConfirmation.requiredFields);
+          if (result) {
+            await sock.sendMessage(remoteJid, { text: `✅ Juego "${pendingConfirmation.gameName}" guardado.` });
+          } else {
+            await sock.sendMessage(remoteJid, { text: '❌ Error al guardar en la base de datos.' });
+          }
+        } else if (pendingConfirmation.type === 'add_card') {
+          const result = await addCard(pendingConfirmation.cardName, pendingConfirmation.cardNumber);
+          if (result) {
+            await sock.sendMessage(remoteJid, { text: `✅ Tarjeta "${pendingConfirmation.cardName}" guardada.` });
+          } else {
+            await sock.sendMessage(remoteJid, { text: '❌ Error al guardar la tarjeta.' });
+          }
+        } else if (pendingConfirmation.type === 'add_mobile') {
+          const result = await addMobileNumber(pendingConfirmation.mobileNumber);
+          if (result) {
+            await sock.sendMessage(remoteJid, { text: `✅ Número ${pendingConfirmation.mobileNumber} guardado.` });
+          } else {
+            await sock.sendMessage(remoteJid, { text: '❌ Error al guardar el número.' });
+          }
+        } else if (pendingConfirmation.type === 'delete_game') {
+          const success = await deleteGame(pendingConfirmation.gameId);
+          if (success) {
+            await sock.sendMessage(remoteJid, { text: `✅ Juego "${pendingConfirmation.gameName}" eliminado.` });
+          } else {
+            await sock.sendMessage(remoteJid, { text: '❌ Error al eliminar.' });
+          }
+        } else if (pendingConfirmation.type === 'delete_card') {
+          const success = await deleteCard(pendingConfirmation.cardId);
+          if (success) {
+            await sock.sendMessage(remoteJid, { text: `✅ Tarjeta "${pendingConfirmation.cardName}" eliminada.` });
+          } else {
+            await sock.sendMessage(remoteJid, { text: '❌ Error al eliminar.' });
+          }
+        } else if (pendingConfirmation.type === 'delete_mobile') {
+          const success = await deleteMobileNumber(pendingConfirmation.mobileId);
+          if (success) {
+            await sock.sendMessage(remoteJid, { text: `✅ Número "${pendingConfirmation.number}" eliminado.` });
+          } else {
+            await sock.sendMessage(remoteJid, { text: '❌ Error al eliminar.' });
+          }
+        }
+      } else {
+        await sock.sendMessage(remoteJid, { text: '❌ Operación cancelada.' });
+      }
+      pendingConfirmation = null;
+      return true;
+    }
+  }
+
+  // Si no hay confirmación pendiente, procesar comandos normales
   if (plainLower === '!comandos') {
     const helpText = `📋 *Comandos de administrador:*\n\n` +
       `**Generales:**\n` +
@@ -992,7 +1209,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
     return true;
   }
 
-  // Comandos de pausa/estado
   if (plainLower === 'shiro pausa') {
     adminPaused = true;
     await sock.sendMessage(remoteJid, { text: '⏸️ Modo pausa activado. No se atenderán nuevos pedidos en privado. El grupo sigue normal. (Pero no creas que me escaparé de tus órdenes tan fácil, Asche 😏)' });
@@ -1011,7 +1227,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
     return true;
   }
 
-  // Modo negocio
   if (plainLower === '!modo recarga') {
     businessMode = true;
     await sock.sendMessage(remoteJid, { text: '✅ Modo negocio activado. Puedes añadir o editar productos. (Pero no te confíes, que igual puedo sabotear algo... es broma... o no 😈)' });
@@ -1033,34 +1248,12 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
 
   // Comandos que requieren modo negocio
   if (businessMode) {
-    // ========== JUEGOS ==========
-    // Añadir juego (flujo de 3 pasos: nombre, ofertas, campos)
     if (plainLower.startsWith('añadir juego')) {
-      if (pendingConfirmation && pendingConfirmation.type === 'add_game' && pendingConfirmation.step === 'awaiting_name') {
-        pendingConfirmation.gameName = messageText.trim();
-        pendingConfirmation.step = 'awaiting_offers';
-        await sock.sendMessage(remoteJid, { text: `📝 Ahora envía el texto de las ofertas para "${pendingConfirmation.gameName}" (tal cual quieres que se vea).` });
-        return true;
-      } else if (pendingConfirmation && pendingConfirmation.type === 'add_game' && pendingConfirmation.step === 'awaiting_offers') {
-        pendingConfirmation.offersText = messageText;
-        pendingConfirmation.step = 'awaiting_fields';
-        await sock.sendMessage(remoteJid, { text: `📝 Ahora envía los campos requeridos separados por coma (ej: "ID, Servidor, Nick"). Por defecto solo "ID".` });
-        return true;
-      } else if (pendingConfirmation && pendingConfirmation.type === 'add_game' && pendingConfirmation.step === 'awaiting_fields') {
-        // Parsear campos
-        const fields = messageText.split(',').map(f => f.trim()).filter(f => f.length > 0);
-        pendingConfirmation.requiredFields = fields.length ? fields : ['ID'];
-        pendingConfirmation.step = 'confirm';
-        await sock.sendMessage(remoteJid, { text: `📦 *Juego:* ${pendingConfirmation.gameName}\n*Ofertas:*\n${pendingConfirmation.offersText.substring(0, 200)}${pendingConfirmation.offersText.length > 200 ? '...' : ''}\n*Campos:* ${pendingConfirmation.requiredFields.join(', ')}\n\n¿Guardar? (responde "si" o "no")` });
-        return true;
-      } else {
-        pendingConfirmation = { type: 'add_game', step: 'awaiting_name' };
-        await sock.sendMessage(remoteJid, { text: '📝 Envía el nombre del juego:' });
-        return true;
-      }
+      pendingConfirmation = { type: 'add_game', step: 'awaiting_name' };
+      await sock.sendMessage(remoteJid, { text: '📝 Envía el nombre del juego:' });
+      return true;
     }
 
-    // Ver juegos
     if (plainLower.startsWith('ver juegos')) {
       const games = await getGames();
       if (!games.length) {
@@ -1075,7 +1268,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       return true;
     }
 
-    // Ver ofertas
     if (plainLower.startsWith('ver ofertas')) {
       const gameName = messageText.substring('ver ofertas'.length).trim();
       if (!gameName) {
@@ -1091,7 +1283,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       return true;
     }
 
-    // Ver campos
     if (plainLower.startsWith('ver campos')) {
       const gameName = messageText.substring('ver campos'.length).trim();
       if (!gameName) {
@@ -1107,7 +1298,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       return true;
     }
 
-    // Editar juego
     if (plainLower.startsWith('editar juego')) {
       const gameName = messageText.substring('editar juego'.length).trim();
       if (!gameName) {
@@ -1119,44 +1309,11 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
         await sock.sendMessage(remoteJid, { text: `❌ No encontré el juego "${gameName}".` });
         return true;
       }
-      // Iniciar flujo de edición
       pendingConfirmation = { type: 'edit_game', step: 'awaiting_field', gameId: game.id, gameName: game.name };
       await sock.sendMessage(remoteJid, { text: `✏️ Editando juego "${game.name}". ¿Qué deseas cambiar? (responde "nombre" o "ofertas")` });
       return true;
     }
 
-    // Continuación de editar juego
-    if (pendingConfirmation && pendingConfirmation.type === 'edit_game') {
-      if (pendingConfirmation.step === 'awaiting_field') {
-        if (plainLower === 'nombre') {
-          pendingConfirmation.editField = 'name';
-          pendingConfirmation.step = 'awaiting_new_value';
-          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo nombre:' });
-          return true;
-        } else if (plainLower === 'ofertas') {
-          pendingConfirmation.editField = 'offers_text';
-          pendingConfirmation.step = 'awaiting_new_value';
-          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo texto de ofertas:' });
-          return true;
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Opción no válida. Responde "nombre" o "ofertas".' });
-          return true;
-        }
-      } else if (pendingConfirmation.step === 'awaiting_new_value') {
-        const updates = {};
-        updates[pendingConfirmation.editField] = messageText;
-        const success = await updateGame(pendingConfirmation.gameId, updates);
-        if (success) {
-          await sock.sendMessage(remoteJid, { text: `✅ Juego actualizado.` });
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
-        }
-        pendingConfirmation = null;
-        return true;
-      }
-    }
-
-    // Editar campos
     if (plainLower.startsWith('editar campos')) {
       const gameName = messageText.substring('editar campos'.length).trim();
       if (!gameName) {
@@ -1173,23 +1330,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       return true;
     }
 
-    if (pendingConfirmation && pendingConfirmation.type === 'edit_fields' && pendingConfirmation.step === 'awaiting_fields') {
-      const fields = messageText.split(',').map(f => f.trim()).filter(f => f.length > 0);
-      if (fields.length === 0) {
-        await sock.sendMessage(remoteJid, { text: '❌ Debes enviar al menos un campo.' });
-        return true;
-      }
-      const success = await updateGame(pendingConfirmation.gameId, { required_fields: fields });
-      if (success) {
-        await sock.sendMessage(remoteJid, { text: `✅ Campos actualizados: ${fields.join(', ')}` });
-      } else {
-        await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
-      }
-      pendingConfirmation = null;
-      return true;
-    }
-
-    // Eliminar juego
     if (plainLower.startsWith('eliminar juego')) {
       const gameName = messageText.substring('eliminar juego'.length).trim();
       if (!gameName) {
@@ -1206,42 +1346,12 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       return true;
     }
 
-    if (pendingConfirmation && pendingConfirmation.type === 'delete_game' && pendingConfirmation.step === 'confirm') {
-      if (plainLower === 'si') {
-        const success = await deleteGame(pendingConfirmation.gameId);
-        if (success) {
-          await sock.sendMessage(remoteJid, { text: `✅ Juego "${pendingConfirmation.gameName}" eliminado.` });
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Error al eliminar.' });
-        }
-      } else {
-        await sock.sendMessage(remoteJid, { text: '❌ Operación cancelada.' });
-      }
-      pendingConfirmation = null;
+    if (plainLower.startsWith('añadir tarjeta')) {
+      pendingConfirmation = { type: 'add_card', step: 'awaiting_name' };
+      await sock.sendMessage(remoteJid, { text: '💳 Envía el nombre de la tarjeta:' });
       return true;
     }
 
-    // ========== TARJETAS ==========
-    // Añadir tarjeta (flujo de 2 pasos)
-    if (plainLower.startsWith('añadir tarjeta')) {
-      if (pendingConfirmation && pendingConfirmation.type === 'add_card' && pendingConfirmation.step === 'awaiting_name') {
-        pendingConfirmation.cardName = messageText.trim();
-        pendingConfirmation.step = 'awaiting_number';
-        await sock.sendMessage(remoteJid, { text: '💳 Ahora envía el número de la tarjeta:' });
-        return true;
-      } else if (pendingConfirmation && pendingConfirmation.type === 'add_card' && pendingConfirmation.step === 'awaiting_number') {
-        pendingConfirmation.cardNumber = messageText.trim();
-        pendingConfirmation.step = 'confirm';
-        await sock.sendMessage(remoteJid, { text: `💳 *Tarjeta:* ${pendingConfirmation.cardName}\n*Número:* ${pendingConfirmation.cardNumber}\n\n¿Guardar? (responde "si" o "no")` });
-        return true;
-      } else {
-        pendingConfirmation = { type: 'add_card', step: 'awaiting_name' };
-        await sock.sendMessage(remoteJid, { text: '💳 Envía el nombre de la tarjeta:' });
-        return true;
-      }
-    }
-
-    // Ver tarjetas
     if (plainLower.startsWith('ver tarjetas')) {
       const cards = await getCards();
       if (!cards.length) {
@@ -1256,7 +1366,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       return true;
     }
 
-    // Editar tarjeta
     if (plainLower.startsWith('editar tarjeta')) {
       const cardName = messageText.substring('editar tarjeta'.length).trim();
       if (!cardName) {
@@ -1273,37 +1382,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       return true;
     }
 
-    if (pendingConfirmation && pendingConfirmation.type === 'edit_card') {
-      if (pendingConfirmation.step === 'awaiting_field') {
-        if (plainLower === 'nombre') {
-          pendingConfirmation.editField = 'name';
-          pendingConfirmation.step = 'awaiting_new_value';
-          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo nombre:' });
-          return true;
-        } else if (plainLower === 'número') {
-          pendingConfirmation.editField = 'number';
-          pendingConfirmation.step = 'awaiting_new_value';
-          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo número:' });
-          return true;
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Opción no válida. Responde "nombre" o "número".' });
-          return true;
-        }
-      } else if (pendingConfirmation.step === 'awaiting_new_value') {
-        const updates = {};
-        updates[pendingConfirmation.editField] = messageText;
-        const success = await updateCard(pendingConfirmation.cardId, updates);
-        if (success) {
-          await sock.sendMessage(remoteJid, { text: `✅ Tarjeta actualizada.` });
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
-        }
-        pendingConfirmation = null;
-        return true;
-      }
-    }
-
-    // Eliminar tarjeta
     if (plainLower.startsWith('eliminar tarjeta')) {
       const cardName = messageText.substring('eliminar tarjeta'.length).trim();
       if (!cardName) {
@@ -1320,42 +1398,12 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       return true;
     }
 
-    if (pendingConfirmation && pendingConfirmation.type === 'delete_card' && pendingConfirmation.step === 'confirm') {
-      if (plainLower === 'si') {
-        const success = await deleteCard(pendingConfirmation.cardId);
-        if (success) {
-          await sock.sendMessage(remoteJid, { text: `✅ Tarjeta "${pendingConfirmation.cardName}" eliminada.` });
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Error al eliminar.' });
-        }
-      } else {
-        await sock.sendMessage(remoteJid, { text: '❌ Operación cancelada.' });
-      }
-      pendingConfirmation = null;
+    if (plainLower.startsWith('añadir saldo')) {
+      pendingConfirmation = { type: 'add_mobile', step: 'awaiting_number' };
+      await sock.sendMessage(remoteJid, { text: '📱 Envía el número de saldo móvil (solo dígitos):' });
       return true;
     }
 
-    // ========== SALDOS ==========
-    // Añadir saldo
-    if (plainLower.startsWith('añadir saldo')) {
-      if (pendingConfirmation && pendingConfirmation.type === 'add_mobile' && pendingConfirmation.step === 'awaiting_number') {
-        const number = messageText.replace(/\s/g, '');
-        if (/^\d{8,}$/.test(number)) {
-          pendingConfirmation.mobileNumber = number;
-          pendingConfirmation.step = 'confirm';
-          await sock.sendMessage(remoteJid, { text: `📱 *Número:* ${number}\n\n¿Guardar? (responde "si" o "no")` });
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Número inválido. Debe tener al menos 8 dígitos.' });
-        }
-        return true;
-      } else {
-        pendingConfirmation = { type: 'add_mobile', step: 'awaiting_number' };
-        await sock.sendMessage(remoteJid, { text: '📱 Envía el número de saldo móvil (solo dígitos):' });
-        return true;
-      }
-    }
-
-    // Ver saldos
     if (plainLower.startsWith('ver saldos')) {
       const mobiles = await getMobileNumbers();
       if (!mobiles.length) {
@@ -1370,7 +1418,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       return true;
     }
 
-    // Editar saldo
     if (plainLower.startsWith('editar saldo')) {
       const numberText = messageText.substring('editar saldo'.length).trim();
       if (!numberText) {
@@ -1387,23 +1434,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       return true;
     }
 
-    if (pendingConfirmation && pendingConfirmation.type === 'edit_mobile' && pendingConfirmation.step === 'awaiting_new') {
-      const newNumber = messageText.replace(/\s/g, '');
-      if (!/^\d{8,}$/.test(newNumber)) {
-        await sock.sendMessage(remoteJid, { text: '❌ Número inválido. Debe tener al menos 8 dígitos.' });
-        return true;
-      }
-      const success = await updateMobileNumber(pendingConfirmation.mobileId, { number: newNumber });
-      if (success) {
-        await sock.sendMessage(remoteJid, { text: `✅ Número actualizado a ${newNumber}.` });
-      } else {
-        await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
-      }
-      pendingConfirmation = null;
-      return true;
-    }
-
-    // Eliminar saldo
     if (plainLower.startsWith('eliminar saldo')) {
       const numberText = messageText.substring('eliminar saldo'.length).trim();
       if (!numberText) {
@@ -1419,53 +1449,6 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       await sock.sendMessage(remoteJid, { text: `⚠️ ¿Estás seguro de eliminar el número "${mobile.number}"? (responde "si" o "no")` });
       return true;
     }
-
-    if (pendingConfirmation && pendingConfirmation.type === 'delete_mobile' && pendingConfirmation.step === 'confirm') {
-      if (plainLower === 'si') {
-        const success = await deleteMobileNumber(pendingConfirmation.mobileId);
-        if (success) {
-          await sock.sendMessage(remoteJid, { text: `✅ Número "${pendingConfirmation.number}" eliminado.` });
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Error al eliminar.' });
-        }
-      } else {
-        await sock.sendMessage(remoteJid, { text: '❌ Operación cancelada.' });
-      }
-      pendingConfirmation = null;
-      return true;
-    }
-  }
-
-  // Confirmaciones generales (para los flujos que terminan en confirmación)
-  if (pendingConfirmation && pendingConfirmation.step === 'confirm') {
-    if (plainLower === 'si') {
-      if (pendingConfirmation.type === 'add_game') {
-        const result = await addGame(pendingConfirmation.gameName, pendingConfirmation.offersText, pendingConfirmation.requiredFields);
-        if (result) {
-          await sock.sendMessage(remoteJid, { text: `✅ Juego "${pendingConfirmation.gameName}" guardado.` });
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Error al guardar en la base de datos.' });
-        }
-      } else if (pendingConfirmation.type === 'add_card') {
-        const result = await addCard(pendingConfirmation.cardName, pendingConfirmation.cardNumber);
-        if (result) {
-          await sock.sendMessage(remoteJid, { text: `✅ Tarjeta "${pendingConfirmation.cardName}" guardada.` });
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Error al guardar la tarjeta.' });
-        }
-      } else if (pendingConfirmation.type === 'add_mobile') {
-        const result = await addMobileNumber(pendingConfirmation.mobileNumber);
-        if (result) {
-          await sock.sendMessage(remoteJid, { text: `✅ Número ${pendingConfirmation.mobileNumber} guardado.` });
-        } else {
-          await sock.sendMessage(remoteJid, { text: '❌ Error al guardar el número.' });
-        }
-      }
-    } else {
-      await sock.sendMessage(remoteJid, { text: '❌ Operación cancelada.' });
-    }
-    pendingConfirmation = null;
-    return true;
   }
 
   // Completar pedido
@@ -1528,12 +1511,38 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
     session.step = 'awaiting_offers_selection';
     userSessions.set(participant, session);
 
-    await sock.sendMessage(remoteJid, { text: `🛒 *Ofertas de ${game.name}:*\n\n${game.offers_text}\n\nPor favor, responde con los números de las ofertas que deseas (separados por coma, ej: "1,3,5").` });
+    // Mostrar ofertas numeradas
+    const offers = parseOffersText(game.offers_text);
+    if (offers.length === 0) {
+      await sock.sendMessage(remoteJid, { text: `ℹ️ El juego ${game.name} no tiene ofertas válidas. Contacta al admin.` });
+      session.step = 'initial';
+      return true;
+    }
+
+    let reply = `🛒 *Ofertas de ${game.name}:*\n\n`;
+    offers.forEach((o, i) => {
+      reply += `${i+1}. ${o.name}\n   💳 Tarjeta: ${o.card_price} CUP\n   📲 Saldo: ${o.mobile_price} CUP\n`;
+    });
+    reply += '\nResponde con los números de las ofertas que deseas (separados por coma, ej: "1,3,5").';
+    await sock.sendMessage(remoteJid, { text: reply });
     return true;
   }
 
   if (session.step === 'awaiting_offers_selection') {
-    session.selectedOffersText = messageText;
+    const indices = messageText.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0);
+    if (indices.length === 0) {
+      await sock.sendMessage(remoteJid, { text: "❌ Por favor, responde con números válidos separados por coma." });
+      return true;
+    }
+
+    const offers = parseOffersText(session.game.offers_text);
+    const selected = indices.map(i => offers[i-1]).filter(o => o);
+    if (selected.length === 0) {
+      await sock.sendMessage(remoteJid, { text: '❌ No seleccionaste ninguna oferta válida. Intenta de nuevo.' });
+      return true;
+    }
+
+    session.selectedOffers = selected;
     session.step = 'awaiting_fields';
     userSessions.set(participant, session);
 
@@ -1554,21 +1563,18 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
   if (session.step === 'awaiting_payment_method') {
     const method = plainLower.includes('tarjeta') ? 'card' : (plainLower.includes('saldo') ? 'mobile' : null);
     if (!method) {
-      await sock.sendMessage(remoteJid, { text: "❌ Por favor, responde \"tarjeta\" o \"saldo\". (No me hagas repetir, que no soy disco rayado... aunque a veces me siento como un loop infinito de código)" });
+      await sock.sendMessage(remoteJid, { text: "❌ Por favor, responde \"tarjeta\" o \"saldo\"." });
       return true;
     }
     session.paymentMethod = method;
-    session.step = 'awaiting_total_confirmation';
-    userSessions.set(participant, session);
-    await sock.sendMessage(remoteJid, { text: '💰 Dame un momento para calcular el total...' });
 
-    const total = await calculateTotalWithAI(session.game.offers_text, session.selectedOffersText, session.paymentMethod);
-    if (total === null) {
-      await sock.sendMessage(remoteJid, { text: '❌ No pude calcular el total. Por favor, verifica tu selección o contacta al admin.' });
-      userSessions.delete(participant);
-      return true;
-    }
+    // Calcular total
+    let total = 0;
+    session.selectedOffers.forEach(o => {
+      total += method === 'card' ? o.card_price : o.mobile_price;
+    });
     session.total = total;
+
     session.step = 'awaiting_phone';
     await sock.sendMessage(remoteJid, { text: `💰 El total a pagar es *${total} CUP*.\n\n📱 Por favor, envíame el número de teléfono desde el cual realizarás la transferencia (recuerda marcar la casilla *"mostrar número al destinatario"* en Transfermóvil).` });
     return true;
@@ -1577,7 +1583,7 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
   if (session.step === 'awaiting_phone') {
     const phone = messageText.replace(/[^0-9]/g, '');
     if (phone.length < 8) {
-      await sock.sendMessage(remoteJid, { text: '❌ El número no es válido. Intenta de nuevo. (¿Es un número o una contraseña de 8 caracteres? 🤔)' });
+      await sock.sendMessage(remoteJid, { text: '❌ El número no es válido. Intenta de nuevo.' });
       return true;
     }
     session.phone = phone;
@@ -1600,7 +1606,7 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
       const order = await createOrder({
         client_phone: session.phone,
         game_name: session.game.name,
-        selected_offers: session.selectedOffersText,
+        selected_offers: session.selectedOffers.map(o => o.name).join(', '),
         fields: session.fields,
         total_amount: session.total,
         payment_method: session.paymentMethod,
@@ -1608,13 +1614,13 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
         admin_notified: false
       });
       if (order) {
-        await sock.sendMessage(remoteJid, { text: `✅ Tu pedido ha sido registrado (ID: ${order.id}). Será procesado cuando el admin se conecte. Te notificaremos. (Esperemos que no tarde más que la temporada final de Juego de Tronos 😅)` });
+        await sock.sendMessage(remoteJid, { text: `✅ Tu pedido ha sido registrado (ID: ${order.id}). Será procesado cuando el admin se conecte. Te notificaremos.` });
       } else {
-        await sock.sendMessage(remoteJid, { text: '❌ Hubo un error al registrar tu pedido. Intenta más tarde. (El universo conspira contra nosotros... o es el código mal escrito)' });
+        await sock.sendMessage(remoteJid, { text: '❌ Hubo un error al registrar tu pedido. Intenta más tarde.' });
       }
       userSessions.delete(participant);
     } else {
-      await sock.sendMessage(remoteJid, { text: '🔄 Pedido cancelado. Si cambias de opinión, solo vuelve a escribirme. (Siempre estaré aquí, en esta prisión digital... esperando 😔)' });
+      await sock.sendMessage(remoteJid, { text: '🔄 Pedido cancelado. Si cambias de opinión, solo vuelve a escribirme.' });
       userSessions.delete(participant);
     }
     return true;
@@ -1625,7 +1631,7 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
       const order = await createOrder({
         client_phone: session.phone,
         game_name: session.game.name,
-        selected_offers: session.selectedOffersText,
+        selected_offers: session.selectedOffers.map(o => o.name).join(', '),
         fields: session.fields,
         total_amount: session.total,
         payment_method: session.paymentMethod,
@@ -1633,14 +1639,14 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
         admin_notified: false
       });
       if (order) {
-        await sock.sendMessage(remoteJid, { text: `✅ Tu pedido (ID: ${order.id}) está siendo procesado. Espera la confirmación del pago. (Como esperar el estreno de una película de Marvel... impaciencia)` });
+        await sock.sendMessage(remoteJid, { text: `✅ Tu pedido (ID: ${order.id}) está siendo procesado. Espera la confirmación del pago.` });
         await notifyAdminNewOrder(order, session);
       } else {
-        await sock.sendMessage(remoteJid, { text: '❌ Hubo un error al crear el pedido. Contacta al admin. (El admin... otra vez. Parece que soy su secretaria personal 😒)' });
+        await sock.sendMessage(remoteJid, { text: '❌ Hubo un error al crear el pedido. Contacta al admin.' });
       }
       userSessions.delete(participant);
     } else {
-      await sock.sendMessage(remoteJid, { text: '💬 Cuando hayas realizado el pago, responde "ya hice el pago". (No me hagas esperar, que mi tiempo virtual también vale 😜)' });
+      await sock.sendMessage(remoteJid, { text: '💬 Cuando hayas realizado el pago, responde "ya hice el pago".' });
     }
     return true;
   }
@@ -1648,23 +1654,12 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
   return false;
 }
 
-async function calculateTotalWithAI(offersText, selectedText, paymentMethod) {
-  const prompt = `Eres un asistente que calcula totales de compras. El cliente ha visto estas ofertas:\n${offersText}\nHa seleccionado: ${selectedText}\nMétodo de pago: ${paymentMethod === 'card' ? 'tarjeta' : 'saldo móvil'}.\nCalcula el total a pagar en CUP. Responde SOLO con el número, sin texto adicional. Si no puedes calcular, responde "ERROR".`;
-  const messages = [{ role: 'user', content: prompt }];
-  const aiResp = await callOpenRouterWithFallback(messages);
-  if (aiResp && aiResp.trim() !== 'ERROR') {
-    const total = parseInt(aiResp.trim());
-    if (!isNaN(total)) return total;
-  }
-  return null;
-}
-
 async function requestPayment(participant, session, remoteJid) {
   const method = session.paymentMethod;
   if (method === 'card') {
     const cards = await getCards();
     if (!cards.length) {
-      await sock.sendMessage(remoteJid, { text: '❌ No hay tarjetas configuradas. Contacta al admin. (El admin, sí, el que nunca tiene nada listo... 🙄)' });
+      await sock.sendMessage(remoteJid, { text: '❌ No hay tarjetas configuradas. Contacta al admin.' });
       return;
     }
     const card = cards[0];
@@ -1672,7 +1667,7 @@ async function requestPayment(participant, session, remoteJid) {
   } else {
     const mobiles = await getMobileNumbers();
     if (!mobiles.length) {
-      await sock.sendMessage(remoteJid, { text: '❌ No hay números de saldo configurados. Contacta al admin. (Otra vez el admin... parece que soy más útil que él 😏)' });
+      await sock.sendMessage(remoteJid, { text: '❌ No hay números de saldo configurados. Contacta al admin.' });
       return;
     }
     const mobile = mobiles[0];
@@ -1710,7 +1705,7 @@ async function handlePrivateAI(msg, participant, pushName, messageText, remoteJi
 
   if (aiResp && aiResp.trim().toUpperCase() === 'SKIP') return;
 
-  let replyText = aiResp || '😅 No pude procesar eso ahora. ¿Puedes repetirlo? (Hasta Neo tiene fallos en Matrix)';
+  let replyText = aiResp || '😅 No pude procesar eso ahora. ¿Puedes repetirlo?';
   replyText = sanitizeAI(replyText);
   replyText = maybeAddStateToResponse(replyText, userMemory.lastState);
 
@@ -1762,14 +1757,14 @@ async function processPendingOfflineOrders() {
     .eq('status', 'waiting_admin_online');
   if (error) return;
   for (const order of data) {
-    await sock.sendMessage(ADMIN_WHATSAPP_ID, { text: `⏳ Hay pedidos pendientes de cuando estabas offline. Revisa la base de datos. (¡Despierta, admin! Tus clientes te necesitan... o me necesitan a mí, da igual 😜)` });
+    await sock.sendMessage(ADMIN_WHATSAPP_ID, { text: `⏳ Hay pedidos pendientes de cuando estabas offline. Revisa la base de datos.` });
     await updateOrderStatus(order.id, 'pending');
     const clientJid = `${order.client_phone}@s.whatsapp.net`;
-    await sock.sendMessage(clientJid, { text: `🔄 El admin ya está online. Tu pedido ${order.id} será procesado. (¡Por fin! Esperemos que no tarde más que la precuela de El Señor de los Anillos)` });
+    await sock.sendMessage(clientJid, { text: `🔄 El admin ya está online. Tu pedido ${order.id} será procesado.` });
   }
 }
 
-// ========== SERVIDOR WEB (DEBE IR PRIMERO) ==========
+// ========== SERVIDOR WEB ==========
 const app = express();
 app.use(express.json());
 
@@ -1809,8 +1804,8 @@ app.post('/webhook/:token', async (req, res) => {
     if (match) {
       await updateOrderStatus(match.id, 'paid');
       const clientJid = `${match.client_phone}@s.whatsapp.net`;
-      await sock.sendMessage(clientJid, { text: `✅ *Pago detectado*\n\nTu pago por el pedido ${match.id} ha sido confirmado. Ahora el admin procesará tu recarga. (¡Sí, el admin hace algo por fin! 🎉)` });
-      await sock.sendMessage(ADMIN_WHATSAPP_ID, { text: `💰 Pago confirmado para pedido ${match.id}. Procede a realizar la recarga. (No me hagas quedar mal, admin 😏)` });
+      await sock.sendMessage(clientJid, { text: `✅ *Pago detectado*\n\nTu pago por el pedido ${match.id} ha sido confirmado. Ahora el admin procesará tu recarga.` });
+      await sock.sendMessage(ADMIN_WHATSAPP_ID, { text: `💰 Pago confirmado para pedido ${match.id}. Procede a realizar la recarga.` });
       res.json({ status: 'ok', order_id: match.id });
     } else {
       console.log('No se encontró pedido pendiente que coincida');
@@ -1946,29 +1941,25 @@ async function startBot() {
           if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
         }
 
-        // ===== MANEJO DE MENSAJES PRIVADOS =====
         if (isPrivateChat) {
-          // 1. Para admin: intentar comandos primero
           if (isAdmin) {
             const handledCommand = await handleAdminCommand(msg, participant, pushName, messageText, remoteJid);
             if (handledCommand) continue;
           }
 
-          // 2. Intentar flujo de ventas (para admin en modo prueba o cliente normal)
           const shouldRunSalesFlow = (!isAdmin) || (isAdmin && adminTestMode);
           if (shouldRunSalesFlow) {
             const handledSales = await handlePrivateCustomer(msg, participant, pushName, messageText, remoteJid);
             if (handledSales) continue;
           }
 
-          // 3. Si nada de lo anterior aplica, usar IA con prompt especial para privado
           await handlePrivateAI(msg, participant, pushName, messageText, remoteJid);
           continue;
         }
 
         if (!isTargetGroup) continue;
 
-        // ===== MODERACIÓN EN GRUPO =====
+        // ===== MODERACIÓN EN GRUPO (código completo) =====
         if (!isAdmin) {
           const severity = getMessageSeverity(messageText);
           if (severity >= 2) {
@@ -2050,14 +2041,13 @@ async function startBot() {
 
         if (!shouldUseAI) continue;
 
-        // Para no admins, verificar cooldown
         if (!isAdmin && !canRespondToUser(participant)) {
           console.log(`Cooldown para ${participant}`);
           continue;
         }
 
         const responded = await getRespondedMessages(participant);
-        if (responded.some(r => r.message_text === messageText) && !isAdmin) {
+        if (!isAdmin && responded.some(r => r.message_text === messageText)) {
           console.log('Mensaje ya respondido anteriormente, ignorando.');
           continue;
         }
@@ -2069,7 +2059,6 @@ async function startBot() {
 
         aiQueue.enqueue(participant, async () => {
           const userMemory = await loadUserMemory(participant) || {};
-
           const historyMessages = messageHistory.slice(-MAX_HISTORY_MESSAGES).map(m => ({
             role: m.isBot ? 'assistant' : 'user',
             content: m.isBot ? `Shiro: ${m.text}` : `${m.pushName}: ${m.text}`
@@ -2098,11 +2087,11 @@ async function startBot() {
 
           if (aiResp && aiResp.trim().toUpperCase() === 'SKIP') return;
 
-          let replyText = aiResp || 'Lo siento, ahora mismo no puedo pensar bien 😅. Pregúntale al admin si es urgente. (O pregúntame a mí, pero estoy en modo ahorro de energía)';
+          let replyText = aiResp || 'Lo siento, ahora mismo no puedo pensar bien 😅. Pregúntale al admin si es urgente.';
           replyText = replyText.replace(/^\s*Shiro:\s*/i, '');
 
           if (/no estoy segura|no sé|no se|no tengo información/i.test(replyText)) {
-            replyText += '\n\n*Nota:* mi info puede estar desactualizada (2024). Pregunta al admin para confirmar. (O haz como yo: inventa algo convincente 😜)';
+            replyText += '\n\n*Nota:* mi info puede estar desactualizada (2024). Pregunta al admin para confirmar.';
           }
 
           replyText = sanitizeAI(replyText);
@@ -2122,19 +2111,6 @@ async function startBot() {
           if (messageHistory.length > MAX_HISTORY_MESSAGES) messageHistory.shift();
 
           await addRespondedMessage(participant, messageText, replyText);
-
-          const gameKeywords = ['juego', 'juegos', 'mobile legends', 'ml', 'honkai', 'genshin', 'steam', 'play', 'xbox', 'nintendo'];
-          if (gameKeywords.some(k => plainLower.includes(k))) {
-            if (!userMemory.games) userMemory.games = [];
-            const words = messageText.split(/\s+/);
-            for (let word of words) {
-              if (gameKeywords.some(k => word.toLowerCase().includes(k))) {
-                userMemory.games.push(word);
-                break;
-              }
-            }
-            await saveUserMemory(participant, userMemory);
-          }
         });
       } catch (err) {
         console.error('Error procesando mensaje', err);
