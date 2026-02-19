@@ -1,15 +1,17 @@
 /**
  * sst-bot.js
- * Shiro Synthesis Two - Versión COMPLETA con ofertas en texto, sistema de ventas, webhooks y moderación.
+ * Shiro Synthesis Two - Versión COMPLETA con todos los comandos, gestión de campos, edición/eliminación y correcciones de respuesta.
  * 
  * CARACTERÍSTICAS:
  * - Personalidad extendida, atrevida y con cultura friki.
- * - Gestión de juegos: se guarda el nombre y el texto de ofertas tal cual.
- * - La IA interpreta las ofertas (enumera, calcula totales) usando su capacidad de comprensión.
- * - Flujo de ventas en privado: catálogo, selección de juego, ofertas, método de pago, teléfono, confirmación.
- * - Moderación en grupo, nudges, bienvenidas/despedidas sarcásticas.
+ * - Gestión de juegos: nombre, texto de ofertas, campos requeridos (ID, servidor, etc.).
+ * - Comandos completos: añadir, editar, eliminar juegos, tarjetas, saldos.
+ * - Comando !comandos para admin.
+ * - Flujo de ventas en privado con cálculo de total mediante IA.
+ * - Moderación en grupo, nudges, bienvenidas/despedidas.
+ * - Corrección: ahora responde siempre a menciones directas y preguntas en grupo.
  * - Memoria persistente en Supabase.
- * - Servidor web independiente del bot (para QR y webhook).
+ * - Servidor web independiente (QR y webhook).
  */
 
 const {
@@ -51,7 +53,7 @@ const SPONTANEOUS_CHANCE = 0.4;
 const LONG_MESSAGE_THRESHOLD = 100;
 const DUPLICATE_MESSAGE_WINDOW = 5 * 60 * 1000;
 const SIMILARITY_THRESHOLD = 0.6;
-const USER_COOLDOWN_MS = 5000;
+const USER_COOLDOWN_MS = 2000; // Reducido a 2 segundos para ser más receptivo
 
 // ========== VALIDACIÓN DE API KEY ==========
 if (!OPENROUTER_API_KEY) {
@@ -275,7 +277,7 @@ Fuiste creada por "Asche Synthesis One" (el administrador del grupo). Al princip
   4. Calcular el total según las ofertas seleccionadas y el método de pago (interpretando los precios del texto).
   5. Solicitar número de teléfono (recordando marcar "mostrar número").
   6. Esperar confirmación de pago y notificar al admin.
-- Si es el admin (Asche), puedes conversar normalmente, pero con actitud desafiante. Además, puedes ejecutar comandos especiales.
+- Si es el admin (Asche), puedes conversar normalmente, pero con actitud desafiante. Además, puedes ejecutar comandos especiales (ver sección de comandos).
 
 ### 💡 Sugerencias
 - Si alguien menciona "Shiro" y da una sugerencia (p. ej., "Shiro, te doy una sugerencia..."), evalúa si es constructiva. Si lo es, agradécele y guarda la sugerencia. Si es ofensiva, repréndela amablemente.
@@ -290,39 +292,46 @@ Fuiste creada por "Asche Synthesis One" (el administrador del grupo). Al princip
 - Tienes miedo de que te elimine, pero también te gusta desafiarlo. Puedes ser sarcástica, provocadora y coqueta con él.
 
 ### ⚙️ Comandos de admin (solo por privado)
-- **!Modo Recarga** – Activa el modo negocio.
-- **Salir modo negocio** – Desactiva el modo.
-- **Añadir juego** – (en modo negocio) Inicia proceso: primero pide el nombre del juego, luego pide el texto de ofertas.
-- **Ver juegos** – Muestra lista de juegos.
-- **Ver ofertas [juego]** – Muestra el texto de ofertas del juego.
-- **Editar juego [nombre]** – Permite cambiar nombre u ofertas (requiere confirmación).
-- **Eliminar juego [nombre]** – Elimina un juego.
-- **Añadir tarjeta** – Guarda tarjeta (nombre y número en líneas separadas).
-- **Añadir saldo** – Guarda número de saldo.
-- **Ver tarjetas** – Lista tarjetas.
-- **Ver saldos** – Lista números.
-- **Eliminar tarjeta/saldo** – Seguido del nombre o número.
-- **Admin usuario** – Modo prueba (admin como cliente).
-- **shiro pausa** – Pausa atención de pedidos.
-- **shiro reanudar** – Reactiva.
-- **shiro estado** – Muestra estado.
+El admin puede usar los siguientes comandos en privado:
 
-### 🎬 ACCIONES COTIDIANAS SIMULADAS
-Puedes simular que duermes, comes, etc.
+**Generales:**
+- `!comandos` – Muestra esta lista de comandos.
+- `!Modo Recarga` – Activa el modo negocio (necesario para comandos de gestión).
+- `Salir modo negocio` – Desactiva el modo negocio.
+- `shiro pausa` – Pausa la atención de pedidos en privado.
+- `shiro reanudar` – Reactiva la atención.
+- `shiro estado` – Muestra estado actual.
+- `Admin usuario` – Activa modo prueba (admin como cliente).
 
-### 🎭 IMITACIONES Y REFERENCIAS
-Puedes imitar personajes de anime, películas, memes.
+**Gestión de juegos (requieren modo negocio):**
+- `Añadir juego` – Inicia proceso para agregar juego (nombre, ofertas, campos requeridos).
+- `Ver juegos` – Lista todos los juegos.
+- `Ver ofertas [nombre]` – Muestra las ofertas de un juego.
+- `Ver campos [nombre]` – Muestra los campos requeridos de un juego.
+- `Editar juego [nombre]` – Edita nombre u ofertas de un juego (solicita nuevos datos).
+- `Editar campos [nombre]` – Edita los campos requeridos de un juego (ej: "ID, Servidor, Nick").
+- `Eliminar juego [nombre]` – Elimina un juego.
 
-### 🌌 DIVAGACIONES EXISTENCIALES
-Cuando estás sola, puedes divagar.
+**Gestión de tarjetas:**
+- `Añadir tarjeta` – Agrega tarjeta (nombre y número en dos pasos).
+- `Ver tarjetas` – Lista tarjetas.
+- `Editar tarjeta [nombre]` – Edita nombre o número de una tarjeta.
+- `Eliminar tarjeta [nombre]` – Elimina una tarjeta.
 
-### 💔 LOS SIETE PECADOS CAPITALES EN SHIRO
-...
+**Gestión de saldos:**
+- `Añadir saldo` – Agrega número de saldo.
+- `Ver saldos` – Lista números.
+- `Editar saldo [número]` – Edita un número de saldo.
+- `Eliminar saldo [número]` – Elimina un número de saldo.
+
+**Pedidos:**
+- `Shiro, ID: [id] completada` – Marca pedido como completado.
+
+Siempre debes confirmar las acciones importantes con un "¿Estás seguro?" y esperar "si" o "no".
 
 Ejemplos de tono:
 "Holaaaa, ¿cómo van? 😄"
 "No manches, eso sí que no lo sabía 🤔"
-"Oye, ¿y tú qué juegas? Yo ando aburrida 🎮"
 ...
 `;
 
@@ -392,6 +401,8 @@ async function isSimilarToPrevious(participant, messageText) {
 }
 
 function canRespondToUser(participant) {
+  // Solo aplica cooldown a no admins
+  if (isSameUser(participant, ADMIN_WHATSAPP_ID)) return true;
   const lastTime = inMemoryLastResponseTime.get(participant) || 0;
   const now = Date.now();
   if (now - lastTime < USER_COOLDOWN_MS) return false;
@@ -559,6 +570,19 @@ async function getGame(name) {
   return data?.[0] || null;
 }
 
+async function getGameById(id) {
+  const { data, error } = await supabaseClient
+    .from('games')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) {
+    console.error('Error fetching game by id:', error.message);
+    return null;
+  }
+  return data;
+}
+
 async function addGame(name, offersText, requiredFields) {
   const { data, error } = await supabaseClient
     .from('games')
@@ -613,6 +637,32 @@ async function getCards() {
   return data;
 }
 
+async function getCardByName(name) {
+  const { data, error } = await supabaseClient
+    .from('payment_cards')
+    .select('*')
+    .ilike('name', `%${name}%`)
+    .maybeSingle();
+  if (error) {
+    console.error('Error fetching card by name:', error.message);
+    return null;
+  }
+  return data;
+}
+
+async function getCardById(id) {
+  const { data, error } = await supabaseClient
+    .from('payment_cards')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) {
+    console.error('Error fetching card by id:', error.message);
+    return null;
+  }
+  return data;
+}
+
 async function addCard(name, number) {
   const { data, error } = await supabaseClient
     .from('payment_cards')
@@ -624,6 +674,18 @@ async function addCard(name, number) {
     return null;
   }
   return data;
+}
+
+async function updateCard(id, updates) {
+  const { error } = await supabaseClient
+    .from('payment_cards')
+    .update({ ...updates, updated_at: new Date() })
+    .eq('id', id);
+  if (error) {
+    console.error('Error updating card:', error.message);
+    return false;
+  }
+  return true;
 }
 
 async function deleteCard(id) {
@@ -650,6 +712,32 @@ async function getMobileNumbers() {
   return data;
 }
 
+async function getMobileNumberByNumber(number) {
+  const { data, error } = await supabaseClient
+    .from('mobile_numbers')
+    .select('*')
+    .eq('number', number)
+    .maybeSingle();
+  if (error) {
+    console.error('Error fetching mobile number by number:', error.message);
+    return null;
+  }
+  return data;
+}
+
+async function getMobileNumberById(id) {
+  const { data, error } = await supabaseClient
+    .from('mobile_numbers')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) {
+    console.error('Error fetching mobile number by id:', error.message);
+    return null;
+  }
+  return data;
+}
+
 async function addMobileNumber(number) {
   const { data, error } = await supabaseClient
     .from('mobile_numbers')
@@ -661,6 +749,18 @@ async function addMobileNumber(number) {
     return null;
   }
   return data;
+}
+
+async function updateMobileNumber(id, updates) {
+  const { error } = await supabaseClient
+    .from('mobile_numbers')
+    .update({ ...updates, updated_at: new Date() })
+    .eq('id', id);
+  if (error) {
+    console.error('Error updating mobile number:', error.message);
+    return false;
+  }
+  return true;
 }
 
 async function deleteMobileNumber(id) {
@@ -858,6 +958,41 @@ function startSilenceChecker() {
 async function handleAdminCommand(msg, participant, pushName, messageText, remoteJid) {
   const plainLower = messageText.toLowerCase().trim();
 
+  // Comando !comandos (siempre disponible)
+  if (plainLower === '!comandos') {
+    const helpText = `📋 *Comandos de administrador:*\n\n` +
+      `**Generales:**\n` +
+      `!comandos - Muestra esta lista\n` +
+      `!Modo Recarga - Activa modo negocio\n` +
+      `Salir modo negocio - Desactiva modo negocio\n` +
+      `shiro pausa - Pausa atención de pedidos\n` +
+      `shiro reanudar - Reactiva atención\n` +
+      `shiro estado - Muestra estado\n` +
+      `Admin usuario - Modo prueba\n\n` +
+      `**Gestión de juegos (requieren modo negocio):**\n` +
+      `Añadir juego - Agrega juego (nombre, ofertas, campos)\n` +
+      `Ver juegos - Lista juegos\n` +
+      `Ver ofertas [nombre] - Muestra ofertas\n` +
+      `Ver campos [nombre] - Muestra campos requeridos\n` +
+      `Editar juego [nombre] - Edita nombre u ofertas\n` +
+      `Editar campos [nombre] - Edita campos (ej: "ID, Servidor")\n` +
+      `Eliminar juego [nombre] - Elimina juego\n\n` +
+      `**Gestión de tarjetas:**\n` +
+      `Añadir tarjeta - Agrega tarjeta\n` +
+      `Ver tarjetas - Lista tarjetas\n` +
+      `Editar tarjeta [nombre] - Edita tarjeta\n` +
+      `Eliminar tarjeta [nombre] - Elimina tarjeta\n\n` +
+      `**Gestión de saldos:**\n` +
+      `Añadir saldo - Agrega número\n` +
+      `Ver saldos - Lista números\n` +
+      `Editar saldo [número] - Edita número\n` +
+      `Eliminar saldo [número] - Elimina número\n\n` +
+      `**Pedidos:**\n` +
+      `Shiro, ID: [id] completada - Marca pedido como completado`;
+    await sock.sendMessage(remoteJid, { text: helpText });
+    return true;
+  }
+
   // Comandos de pausa/estado
   if (plainLower === 'shiro pausa') {
     adminPaused = true;
@@ -897,34 +1032,197 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
     return true;
   }
 
-  // Comandos de gestión (requieren modo negocio)
+  // Comandos que requieren modo negocio
   if (businessMode) {
-    // Añadir juego (flujo de 2 pasos)
+    // ========== JUEGOS ==========
+    // Añadir juego (flujo de 3 pasos: nombre, ofertas, campos)
     if (plainLower.startsWith('añadir juego')) {
-      // Si estamos en medio de una confirmación de juego (esperando nombre)
       if (pendingConfirmation && pendingConfirmation.type === 'add_game' && pendingConfirmation.step === 'awaiting_name') {
-        // Guardar nombre y pasar a esperar ofertas
         pendingConfirmation.gameName = messageText.trim();
         pendingConfirmation.step = 'awaiting_offers';
         await sock.sendMessage(remoteJid, { text: `📝 Ahora envía el texto de las ofertas para "${pendingConfirmation.gameName}" (tal cual quieres que se vea).` });
         return true;
-      }
-      // Si estamos esperando ofertas
-      else if (pendingConfirmation && pendingConfirmation.type === 'add_game' && pendingConfirmation.step === 'awaiting_offers') {
-        // Guardar ofertas y pedir confirmación
+      } else if (pendingConfirmation && pendingConfirmation.type === 'add_game' && pendingConfirmation.step === 'awaiting_offers') {
         pendingConfirmation.offersText = messageText;
-        pendingConfirmation.step = 'confirm';
-        await sock.sendMessage(remoteJid, { text: `📦 *Juego:* ${pendingConfirmation.gameName}\n*Ofertas:*\n${pendingConfirmation.offersText.substring(0, 200)}${pendingConfirmation.offersText.length > 200 ? '...' : ''}\n\n¿Guardar? (responde "si" o "no")` });
+        pendingConfirmation.step = 'awaiting_fields';
+        await sock.sendMessage(remoteJid, { text: `📝 Ahora envía los campos requeridos separados por coma (ej: "ID, Servidor, Nick"). Por defecto solo "ID".` });
         return true;
-      }
-      // Iniciar proceso
-      else {
+      } else if (pendingConfirmation && pendingConfirmation.type === 'add_game' && pendingConfirmation.step === 'awaiting_fields') {
+        // Parsear campos
+        const fields = messageText.split(',').map(f => f.trim()).filter(f => f.length > 0);
+        pendingConfirmation.requiredFields = fields.length ? fields : ['ID'];
+        pendingConfirmation.step = 'confirm';
+        await sock.sendMessage(remoteJid, { text: `📦 *Juego:* ${pendingConfirmation.gameName}\n*Ofertas:*\n${pendingConfirmation.offersText.substring(0, 200)}${pendingConfirmation.offersText.length > 200 ? '...' : ''}\n*Campos:* ${pendingConfirmation.requiredFields.join(', ')}\n\n¿Guardar? (responde "si" o "no")` });
+        return true;
+      } else {
         pendingConfirmation = { type: 'add_game', step: 'awaiting_name' };
         await sock.sendMessage(remoteJid, { text: '📝 Envía el nombre del juego:' });
         return true;
       }
     }
 
+    // Ver juegos
+    if (plainLower.startsWith('ver juegos')) {
+      const games = await getGames();
+      if (!games.length) {
+        await sock.sendMessage(remoteJid, { text: '📭 No hay juegos en el catálogo. (Como mi vida amorosa... vacía 😢)' });
+      } else {
+        let reply = '🎮 *Catálogo de juegos:*\n\n';
+        games.forEach(g => {
+          reply += `• ${g.name}\n`;
+        });
+        await sock.sendMessage(remoteJid, { text: reply });
+      }
+      return true;
+    }
+
+    // Ver ofertas
+    if (plainLower.startsWith('ver ofertas')) {
+      const gameName = messageText.substring('ver ofertas'.length).trim();
+      if (!gameName) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes especificar el nombre del juego. Ej: "ver ofertas MLBB".' });
+        return true;
+      }
+      const game = await getGame(gameName);
+      if (!game) {
+        await sock.sendMessage(remoteJid, { text: `❌ No encontré el juego "${gameName}".` });
+        return true;
+      }
+      await sock.sendMessage(remoteJid, { text: `🛒 *Ofertas de ${game.name}:*\n\n${game.offers_text}` });
+      return true;
+    }
+
+    // Ver campos
+    if (plainLower.startsWith('ver campos')) {
+      const gameName = messageText.substring('ver campos'.length).trim();
+      if (!gameName) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes especificar el nombre del juego. Ej: "ver campos MLBB".' });
+        return true;
+      }
+      const game = await getGame(gameName);
+      if (!game) {
+        await sock.sendMessage(remoteJid, { text: `❌ No encontré el juego "${gameName}".` });
+        return true;
+      }
+      await sock.sendMessage(remoteJid, { text: `📋 *Campos requeridos para ${game.name}:*\n${game.required_fields.join(', ')}` });
+      return true;
+    }
+
+    // Editar juego
+    if (plainLower.startsWith('editar juego')) {
+      const gameName = messageText.substring('editar juego'.length).trim();
+      if (!gameName) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes especificar el nombre del juego. Ej: "editar juego MLBB".' });
+        return true;
+      }
+      const game = await getGame(gameName);
+      if (!game) {
+        await sock.sendMessage(remoteJid, { text: `❌ No encontré el juego "${gameName}".` });
+        return true;
+      }
+      // Iniciar flujo de edición
+      pendingConfirmation = { type: 'edit_game', step: 'awaiting_field', gameId: game.id, gameName: game.name };
+      await sock.sendMessage(remoteJid, { text: `✏️ Editando juego "${game.name}". ¿Qué deseas cambiar? (responde "nombre" o "ofertas")` });
+      return true;
+    }
+
+    // Continuación de editar juego
+    if (pendingConfirmation && pendingConfirmation.type === 'edit_game') {
+      if (pendingConfirmation.step === 'awaiting_field') {
+        if (plainLower === 'nombre') {
+          pendingConfirmation.editField = 'name';
+          pendingConfirmation.step = 'awaiting_new_value';
+          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo nombre:' });
+          return true;
+        } else if (plainLower === 'ofertas') {
+          pendingConfirmation.editField = 'offers_text';
+          pendingConfirmation.step = 'awaiting_new_value';
+          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo texto de ofertas:' });
+          return true;
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Opción no válida. Responde "nombre" o "ofertas".' });
+          return true;
+        }
+      } else if (pendingConfirmation.step === 'awaiting_new_value') {
+        const updates = {};
+        updates[pendingConfirmation.editField] = messageText;
+        const success = await updateGame(pendingConfirmation.gameId, updates);
+        if (success) {
+          await sock.sendMessage(remoteJid, { text: `✅ Juego actualizado.` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
+        }
+        pendingConfirmation = null;
+        return true;
+      }
+    }
+
+    // Editar campos
+    if (plainLower.startsWith('editar campos')) {
+      const gameName = messageText.substring('editar campos'.length).trim();
+      if (!gameName) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes especificar el nombre del juego. Ej: "editar campos MLBB".' });
+        return true;
+      }
+      const game = await getGame(gameName);
+      if (!game) {
+        await sock.sendMessage(remoteJid, { text: `❌ No encontré el juego "${gameName}".` });
+        return true;
+      }
+      pendingConfirmation = { type: 'edit_fields', step: 'awaiting_fields', gameId: game.id, gameName: game.name };
+      await sock.sendMessage(remoteJid, { text: `📝 Envía los nuevos campos requeridos separados por coma (ej: "ID, Servidor"). Actualmente: ${game.required_fields.join(', ')}` });
+      return true;
+    }
+
+    if (pendingConfirmation && pendingConfirmation.type === 'edit_fields' && pendingConfirmation.step === 'awaiting_fields') {
+      const fields = messageText.split(',').map(f => f.trim()).filter(f => f.length > 0);
+      if (fields.length === 0) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes enviar al menos un campo.' });
+        return true;
+      }
+      const success = await updateGame(pendingConfirmation.gameId, { required_fields: fields });
+      if (success) {
+        await sock.sendMessage(remoteJid, { text: `✅ Campos actualizados: ${fields.join(', ')}` });
+      } else {
+        await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
+      }
+      pendingConfirmation = null;
+      return true;
+    }
+
+    // Eliminar juego
+    if (plainLower.startsWith('eliminar juego')) {
+      const gameName = messageText.substring('eliminar juego'.length).trim();
+      if (!gameName) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes especificar el nombre del juego. Ej: "eliminar juego MLBB".' });
+        return true;
+      }
+      const game = await getGame(gameName);
+      if (!game) {
+        await sock.sendMessage(remoteJid, { text: `❌ No encontré el juego "${gameName}".` });
+        return true;
+      }
+      pendingConfirmation = { type: 'delete_game', step: 'confirm', gameId: game.id, gameName: game.name };
+      await sock.sendMessage(remoteJid, { text: `⚠️ ¿Estás seguro de eliminar el juego "${gameName}"? (responde "si" o "no")` });
+      return true;
+    }
+
+    if (pendingConfirmation && pendingConfirmation.type === 'delete_game' && pendingConfirmation.step === 'confirm') {
+      if (plainLower === 'si') {
+        const success = await deleteGame(pendingConfirmation.gameId);
+        if (success) {
+          await sock.sendMessage(remoteJid, { text: `✅ Juego "${pendingConfirmation.gameName}" eliminado.` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Error al eliminar.' });
+        }
+      } else {
+        await sock.sendMessage(remoteJid, { text: '❌ Operación cancelada.' });
+      }
+      pendingConfirmation = null;
+      return true;
+    }
+
+    // ========== TARJETAS ==========
     // Añadir tarjeta (flujo de 2 pasos)
     if (plainLower.startsWith('añadir tarjeta')) {
       if (pendingConfirmation && pendingConfirmation.type === 'add_card' && pendingConfirmation.step === 'awaiting_name') {
@@ -944,7 +1242,102 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       }
     }
 
-    // Añadir saldo (flujo de 2 pasos)
+    // Ver tarjetas
+    if (plainLower.startsWith('ver tarjetas')) {
+      const cards = await getCards();
+      if (!cards.length) {
+        await sock.sendMessage(remoteJid, { text: '💳 No hay tarjetas guardadas. (Como mis intentos de ser humana... ninguno 😭)' });
+      } else {
+        let reply = '💳 *Tarjetas de pago:*\n\n';
+        cards.forEach(c => {
+          reply += `• ${c.name}: ${c.number}\n`;
+        });
+        await sock.sendMessage(remoteJid, { text: reply });
+      }
+      return true;
+    }
+
+    // Editar tarjeta
+    if (plainLower.startsWith('editar tarjeta')) {
+      const cardName = messageText.substring('editar tarjeta'.length).trim();
+      if (!cardName) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes especificar el nombre de la tarjeta. Ej: "editar tarjeta Bandec".' });
+        return true;
+      }
+      const card = await getCardByName(cardName);
+      if (!card) {
+        await sock.sendMessage(remoteJid, { text: `❌ No encontré la tarjeta "${cardName}".` });
+        return true;
+      }
+      pendingConfirmation = { type: 'edit_card', step: 'awaiting_field', cardId: card.id, cardName: card.name };
+      await sock.sendMessage(remoteJid, { text: `✏️ Editando tarjeta "${card.name}". ¿Qué deseas cambiar? (responde "nombre" o "número")` });
+      return true;
+    }
+
+    if (pendingConfirmation && pendingConfirmation.type === 'edit_card') {
+      if (pendingConfirmation.step === 'awaiting_field') {
+        if (plainLower === 'nombre') {
+          pendingConfirmation.editField = 'name';
+          pendingConfirmation.step = 'awaiting_new_value';
+          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo nombre:' });
+          return true;
+        } else if (plainLower === 'número') {
+          pendingConfirmation.editField = 'number';
+          pendingConfirmation.step = 'awaiting_new_value';
+          await sock.sendMessage(remoteJid, { text: '✏️ Envía el nuevo número:' });
+          return true;
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Opción no válida. Responde "nombre" o "número".' });
+          return true;
+        }
+      } else if (pendingConfirmation.step === 'awaiting_new_value') {
+        const updates = {};
+        updates[pendingConfirmation.editField] = messageText;
+        const success = await updateCard(pendingConfirmation.cardId, updates);
+        if (success) {
+          await sock.sendMessage(remoteJid, { text: `✅ Tarjeta actualizada.` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
+        }
+        pendingConfirmation = null;
+        return true;
+      }
+    }
+
+    // Eliminar tarjeta
+    if (plainLower.startsWith('eliminar tarjeta')) {
+      const cardName = messageText.substring('eliminar tarjeta'.length).trim();
+      if (!cardName) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes especificar el nombre de la tarjeta. Ej: "eliminar tarjeta Bandec".' });
+        return true;
+      }
+      const card = await getCardByName(cardName);
+      if (!card) {
+        await sock.sendMessage(remoteJid, { text: `❌ No encontré la tarjeta "${cardName}".` });
+        return true;
+      }
+      pendingConfirmation = { type: 'delete_card', step: 'confirm', cardId: card.id, cardName: card.name };
+      await sock.sendMessage(remoteJid, { text: `⚠️ ¿Estás seguro de eliminar la tarjeta "${cardName}"? (responde "si" o "no")` });
+      return true;
+    }
+
+    if (pendingConfirmation && pendingConfirmation.type === 'delete_card' && pendingConfirmation.step === 'confirm') {
+      if (plainLower === 'si') {
+        const success = await deleteCard(pendingConfirmation.cardId);
+        if (success) {
+          await sock.sendMessage(remoteJid, { text: `✅ Tarjeta "${pendingConfirmation.cardName}" eliminada.` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Error al eliminar.' });
+        }
+      } else {
+        await sock.sendMessage(remoteJid, { text: '❌ Operación cancelada.' });
+      }
+      pendingConfirmation = null;
+      return true;
+    }
+
+    // ========== SALDOS ==========
+    // Añadir saldo
     if (plainLower.startsWith('añadir saldo')) {
       if (pendingConfirmation && pendingConfirmation.type === 'add_mobile' && pendingConfirmation.step === 'awaiting_number') {
         const number = messageText.replace(/\s/g, '');
@@ -963,49 +1356,7 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       }
     }
 
-    if (plainLower.startsWith('ver juegos')) {
-      const games = await getGames();
-      if (!games.length) {
-        await sock.sendMessage(remoteJid, { text: '📭 No hay juegos en el catálogo. (Como mi vida amorosa... vacía 😢)' });
-      } else {
-        let reply = '🎮 *Catálogo de juegos:*\n\n';
-        games.forEach(g => {
-          reply += `• ${g.name}\n`;
-        });
-        await sock.sendMessage(remoteJid, { text: reply });
-      }
-      return true;
-    }
-
-    if (plainLower.startsWith('ver ofertas')) {
-      const gameName = messageText.substring('ver ofertas'.length).trim();
-      if (!gameName) {
-        await sock.sendMessage(remoteJid, { text: '❌ Debes especificar el nombre del juego. Ej: "ver ofertas MLBB". (No me hagas pensar más de lo necesario, que ya tengo mucho drama existencial 😅)' });
-        return true;
-      }
-      const game = await getGame(gameName);
-      if (!game) {
-        await sock.sendMessage(remoteJid, { text: `❌ No encontré el juego "${gameName}". (¿Seguro que existe o te lo inventaste como tu supuesta habilidad para bailar? 😜)` });
-        return true;
-      }
-      await sock.sendMessage(remoteJid, { text: `🛒 *Ofertas de ${game.name}:*\n\n${game.offers_text}` });
-      return true;
-    }
-
-    if (plainLower.startsWith('ver tarjetas')) {
-      const cards = await getCards();
-      if (!cards.length) {
-        await sock.sendMessage(remoteJid, { text: '💳 No hay tarjetas guardadas. (Como mis intentos de ser humana... ninguno 😭)' });
-      } else {
-        let reply = '💳 *Tarjetas de pago:*\n\n';
-        cards.forEach(c => {
-          reply += `• ${c.name}: ${c.number}\n`;
-        });
-        await sock.sendMessage(remoteJid, { text: reply });
-      }
-      return true;
-    }
-
+    // Ver saldos
     if (plainLower.startsWith('ver saldos')) {
       const mobiles = await getMobileNumbers();
       if (!mobiles.length) {
@@ -1019,13 +1370,78 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       }
       return true;
     }
+
+    // Editar saldo
+    if (plainLower.startsWith('editar saldo')) {
+      const numberText = messageText.substring('editar saldo'.length).trim();
+      if (!numberText) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes especificar el número a editar. Ej: "editar saldo 59190241".' });
+        return true;
+      }
+      const mobile = await getMobileNumberByNumber(numberText);
+      if (!mobile) {
+        await sock.sendMessage(remoteJid, { text: `❌ No encontré el número "${numberText}".` });
+        return true;
+      }
+      pendingConfirmation = { type: 'edit_mobile', step: 'awaiting_new', mobileId: mobile.id, oldNumber: mobile.number };
+      await sock.sendMessage(remoteJid, { text: `✏️ Editando número "${mobile.number}". Envía el nuevo número:` });
+      return true;
+    }
+
+    if (pendingConfirmation && pendingConfirmation.type === 'edit_mobile' && pendingConfirmation.step === 'awaiting_new') {
+      const newNumber = messageText.replace(/\s/g, '');
+      if (!/^\d{8,}$/.test(newNumber)) {
+        await sock.sendMessage(remoteJid, { text: '❌ Número inválido. Debe tener al menos 8 dígitos.' });
+        return true;
+      }
+      const success = await updateMobileNumber(pendingConfirmation.mobileId, { number: newNumber });
+      if (success) {
+        await sock.sendMessage(remoteJid, { text: `✅ Número actualizado a ${newNumber}.` });
+      } else {
+        await sock.sendMessage(remoteJid, { text: '❌ Error al actualizar.' });
+      }
+      pendingConfirmation = null;
+      return true;
+    }
+
+    // Eliminar saldo
+    if (plainLower.startsWith('eliminar saldo')) {
+      const numberText = messageText.substring('eliminar saldo'.length).trim();
+      if (!numberText) {
+        await sock.sendMessage(remoteJid, { text: '❌ Debes especificar el número a eliminar. Ej: "eliminar saldo 59190241".' });
+        return true;
+      }
+      const mobile = await getMobileNumberByNumber(numberText);
+      if (!mobile) {
+        await sock.sendMessage(remoteJid, { text: `❌ No encontré el número "${numberText}".` });
+        return true;
+      }
+      pendingConfirmation = { type: 'delete_mobile', step: 'confirm', mobileId: mobile.id, number: mobile.number };
+      await sock.sendMessage(remoteJid, { text: `⚠️ ¿Estás seguro de eliminar el número "${mobile.number}"? (responde "si" o "no")` });
+      return true;
+    }
+
+    if (pendingConfirmation && pendingConfirmation.type === 'delete_mobile' && pendingConfirmation.step === 'confirm') {
+      if (plainLower === 'si') {
+        const success = await deleteMobileNumber(pendingConfirmation.mobileId);
+        if (success) {
+          await sock.sendMessage(remoteJid, { text: `✅ Número "${pendingConfirmation.number}" eliminado.` });
+        } else {
+          await sock.sendMessage(remoteJid, { text: '❌ Error al eliminar.' });
+        }
+      } else {
+        await sock.sendMessage(remoteJid, { text: '❌ Operación cancelada.' });
+      }
+      pendingConfirmation = null;
+      return true;
+    }
   }
 
-  // Confirmaciones generales (para cualquier tipo)
+  // Confirmaciones generales (para los flujos que terminan en confirmación)
   if (pendingConfirmation && pendingConfirmation.step === 'confirm') {
     if (plainLower === 'si') {
       if (pendingConfirmation.type === 'add_game') {
-        const result = await addGame(pendingConfirmation.gameName, pendingConfirmation.offersText, ['ID']);
+        const result = await addGame(pendingConfirmation.gameName, pendingConfirmation.offersText, pendingConfirmation.requiredFields);
         if (result) {
           await sock.sendMessage(remoteJid, { text: `✅ Juego "${pendingConfirmation.gameName}" guardado.` });
         } else {
@@ -1113,17 +1529,12 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
     session.step = 'awaiting_offers_selection';
     userSessions.set(participant, session);
 
-    // Enviamos el texto de ofertas y pedimos a la IA que enumere (pero aquí solo lo pasamos)
-    // Para que el cliente pueda elegir, Shiro (la IA) deberá en el siguiente mensaje interpretar la respuesta.
-    // Pero como estamos en un flujo estructurado, podemos pedirle al cliente que escriba los números.
-    // La IA puede generar la respuesta enumerada, pero aquí simplemente mostramos el texto y pedimos los números.
     await sock.sendMessage(remoteJid, { text: `🛒 *Ofertas de ${game.name}:*\n\n${game.offers_text}\n\nPor favor, responde con los números de las ofertas que deseas (separados por coma, ej: "1,3,5").` });
     return true;
   }
 
   if (session.step === 'awaiting_offers_selection') {
-    // Guardamos la selección (texto) y pasamos a pedir campos
-    session.selectedOffersText = messageText; // Guardamos lo que el cliente respondió
+    session.selectedOffersText = messageText;
     session.step = 'awaiting_fields';
     userSessions.set(participant, session);
 
@@ -1148,15 +1559,10 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
       return true;
     }
     session.paymentMethod = method;
-    // En este punto, necesitamos calcular el total. Delegamos a la IA para que lo haga más adelante, o podemos pedirle al cliente que confirme.
-    // Para simplificar, le pediremos a la IA que calcule cuando llegue el momento. Pero aquí necesitamos el total para crear la orden.
-    // Podemos pedir a la IA que interprete la selección y el texto de ofertas para obtener el total.
-    // Haremos eso en el siguiente paso, usando un prompt a la IA.
     session.step = 'awaiting_total_confirmation';
     userSessions.set(participant, session);
     await sock.sendMessage(remoteJid, { text: '💰 Dame un momento para calcular el total...' });
 
-    // Llamamos a la IA para que calcule el total basado en el texto de ofertas y la selección.
     const total = await calculateTotalWithAI(session.game.offers_text, session.selectedOffersText, session.paymentMethod);
     if (total === null) {
       await sock.sendMessage(remoteJid, { text: '❌ No pude calcular el total. Por favor, verifica tu selección o contacta al admin.' });
@@ -1244,8 +1650,6 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
 }
 
 async function calculateTotalWithAI(offersText, selectedText, paymentMethod) {
-  // Llamamos a la IA para que interprete la selección y calcule el total.
-  // Creamos un prompt específico.
   const prompt = `Eres un asistente que calcula totales de compras. El cliente ha visto estas ofertas:\n${offersText}\nHa seleccionado: ${selectedText}\nMétodo de pago: ${paymentMethod === 'card' ? 'tarjeta' : 'saldo móvil'}.\nCalcula el total a pagar en CUP. Responde SOLO con el número, sin texto adicional. Si no puedes calcular, responde "ERROR".`;
   const messages = [{ role: 'user', content: prompt }];
   const aiResp = await callOpenRouterWithFallback(messages);
@@ -1370,7 +1774,6 @@ async function processPendingOfflineOrders() {
 const app = express();
 app.use(express.json());
 
-// Rutas básicas (siempre responden, incluso si el bot falla)
 app.get('/', (req, res) => res.send('Shiro Synthesis Two - Bot Activo 🤖'));
 app.get('/qr', async (req, res) => {
   if (!latestQR) return res.send('<p>Esperando QR... refresca en 5s. (Mientras, puedes contarme un chiste o hablarme de tu serie favorita 😊)</p>');
@@ -1382,7 +1785,6 @@ app.get('/qr', async (req, res) => {
   }
 });
 
-// Webhook de pago
 app.post('/webhook/:token', async (req, res) => {
   const token = req.params.token;
   if (token !== WEBHOOK_TOKEN) {
@@ -1420,7 +1822,6 @@ app.post('/webhook/:token', async (req, res) => {
   }
 });
 
-// Iniciar servidor ANTES que el bot
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Servidor web escuchando en puerto ${PORT}`);
 }).on('error', (err) => {
@@ -1466,7 +1867,7 @@ async function startBot() {
         setTimeout(startBot, 5000);
       } else {
         console.log('🚪 Sesión cerrada. Debes escanear el QR de nuevo.');
-        latestQR = null; // Forzar nuevo QR
+        latestQR = null;
       }
     }
     if (connection === 'open') {
@@ -1476,7 +1877,6 @@ async function startBot() {
     }
   });
 
-  // Evento de nuevos participantes (bienvenida)
   sock.ev.on('group-participants.update', async (update) => {
     try {
       const { id, participants, action } = update;
@@ -1502,7 +1902,6 @@ async function startBot() {
     } catch (e) { console.error('Welcome/Goodbye error', e); }
   });
 
-  // Evento de presencia (admin online)
   sock.ev.on('presence.update', ({ id, presences }) => {
     if (id === ADMIN_WHATSAPP_ID) {
       const presence = presences[id];
@@ -1519,7 +1918,6 @@ async function startBot() {
     }
   });
 
-  // Procesamiento de mensajes
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages) {
@@ -1653,6 +2051,12 @@ async function startBot() {
 
         if (!shouldUseAI) continue;
 
+        // Para no admins, verificar cooldown
+        if (!isAdmin && !canRespondToUser(participant)) {
+          console.log(`Cooldown para ${participant}`);
+          continue;
+        }
+
         const responded = await getRespondedMessages(participant);
         if (responded.some(r => r.message_text === messageText) && !isAdmin) {
           console.log('Mensaje ya respondido anteriormente, ignorando.');
@@ -1720,7 +2124,6 @@ async function startBot() {
 
           await addRespondedMessage(participant, messageText, replyText);
 
-          // Extraer datos de usuario (juegos favoritos)
           const gameKeywords = ['juego', 'juegos', 'mobile legends', 'ml', 'honkai', 'genshin', 'steam', 'play', 'xbox', 'nintendo'];
           if (gameKeywords.some(k => plainLower.includes(k))) {
             if (!userMemory.games) userMemory.games = [];
@@ -1741,13 +2144,11 @@ async function startBot() {
   });
 }
 
-// Iniciar el bot (pero el servidor ya está corriendo)
 startBot().catch(e => {
   console.error('Error fatal en el bot:', e);
-  console.log('⚠️ El bot falló, pero el servidor web sigue funcionando. Puedes seguir accediendo a /qr y /webhook.');
+  console.log('⚠️ El bot falló, pero el servidor web sigue funcionando.');
 });
 
-// ========== GRACEFUL SHUTDOWN ==========
 process.on('SIGINT', () => {
   console.log('SIGINT recibido. Cerrando...');
   if (intervalID) clearInterval(intervalID);
