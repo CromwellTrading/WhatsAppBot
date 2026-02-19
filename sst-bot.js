@@ -1,6 +1,6 @@
 /**
  * sst-bot.js
- * Shiro Synthesis Two - Versión COMPLETA y DEFINITIVA
+ * Shiro Synthesis Two - Versión COMPLETA Y DEFINITIVA
  * 
  * CARACTERÍSTICAS:
  * - Personalidad extendida con drama y cultura friki.
@@ -10,6 +10,7 @@
  * - Moderación en grupo (enlaces, política, ofertas, etc.).
  * - Webhook para confirmación de pagos.
  * - Servidor web independiente para QR.
+ * - Comandos manuales para forzar estado online/offline y disponibilidad.
  */
 
 const {
@@ -78,8 +79,9 @@ let lastActivity = Date.now();
 let lastNudgeTime = 0;
 let nudgeSent = false;
 let silentCooldownUntil = 0;
-let adminOnline = false;
-let adminPaused = false;
+let adminOnline = false;               // Detectado por presencia (solo si no hay override)
+let adminPaused = false;                // Pausa manual (no disponible)
+let adminManualOverride = null;         // Puede ser 'online', 'offline' o null (usar presencia)
 let businessMode = false;
 let adminTestMode = false;
 let pendingConfirmation = null;
@@ -295,9 +297,14 @@ El admin puede usar los siguientes comandos en privado:
 - \`!comandos\` – Muestra esta lista de comandos.
 - \`!Modo Recarga\` – Activa el modo negocio (necesario para comandos de gestión).
 - \`Salir modo negocio\` – Desactiva el modo negocio.
-- \`shiro pausa\` – Pausa la atención de pedidos en privado.
-- \`shiro reanudar\` – Reactiva la atención.
+- \`shiro pausa\` – Pausa la atención de pedidos en privado (no disponible).
+- \`shiro reanudar\` – Reactiva la atención (disponible).
 - \`shiro estado\` – Muestra estado actual.
+- \`admin online\` – Fuerza el estado online (ignora presencia).
+- \`admin offline\` – Fuerza el estado offline.
+- \`admin auto\` – Vuelve al modo automático (basado en presencia).
+- \`disponible\` – Marca como disponible para pedidos (igual que \`shiro reanudar\`).
+- \`no disponible\` – Marca como no disponible (igual que \`shiro pausa\`).
 - \`Admin usuario\` – Activa modo prueba (admin como cliente).
 
 **Gestión de juegos (requieren modo negocio):**
@@ -1184,6 +1191,11 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
       `shiro pausa - Pausa atención de pedidos\n` +
       `shiro reanudar - Reactiva atención\n` +
       `shiro estado - Muestra estado\n` +
+      `admin online - Fuerza estado online (ignora presencia)\n` +
+      `admin offline - Fuerza estado offline\n` +
+      `admin auto - Vuelve a modo automático (basado en presencia)\n` +
+      `disponible - Marca como disponible (igual que shiro reanudar)\n` +
+      `no disponible - Marca como no disponible (igual que shiro pausa)\n` +
       `Admin usuario - Modo prueba\n\n` +
       `**Gestión de juegos (requieren modo negocio):**\n` +
       `Añadir juego - Agrega juego (nombre, ofertas, campos)\n` +
@@ -1209,6 +1221,37 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
     return true;
   }
 
+  // Comandos de control de estado
+  if (plainLower === 'admin online') {
+    adminManualOverride = 'online';
+    await sock.sendMessage(remoteJid, { text: '✅ Modo manual: forzado a ONLINE (ignorando presencia).' });
+    return true;
+  }
+
+  if (plainLower === 'admin offline') {
+    adminManualOverride = 'offline';
+    await sock.sendMessage(remoteJid, { text: '✅ Modo manual: forzado a OFFLINE.' });
+    return true;
+  }
+
+  if (plainLower === 'admin auto') {
+    adminManualOverride = null;
+    await sock.sendMessage(remoteJid, { text: '✅ Modo automático (basado en presencia).' });
+    return true;
+  }
+
+  if (plainLower === 'disponible') {
+    adminPaused = false;
+    await sock.sendMessage(remoteJid, { text: '▶️ Disponible para pedidos.' });
+    return true;
+  }
+
+  if (plainLower === 'no disponible') {
+    adminPaused = true;
+    await sock.sendMessage(remoteJid, { text: '⏸️ No disponible para pedidos.' });
+    return true;
+  }
+
   if (plainLower === 'shiro pausa') {
     adminPaused = true;
     await sock.sendMessage(remoteJid, { text: '⏸️ Modo pausa activado. No se atenderán nuevos pedidos en privado. El grupo sigue normal. (Pero no creas que me escaparé de tus órdenes tan fácil, Asche 😏)' });
@@ -1222,11 +1265,16 @@ async function handleAdminCommand(msg, participant, pushName, messageText, remot
   }
 
   if (plainLower === 'shiro estado') {
-    const estado = `Admin online: ${adminOnline ? '✅' : '❌'}\nPausa manual: ${adminPaused ? '⏸️' : '▶️'}\nDisponible para pedidos: ${(adminOnline && !adminPaused) ? '✅' : '❌'}`;
+    const effectiveOnline = adminManualOverride !== null ? (adminManualOverride === 'online') : adminOnline;
+    const estado = `Modo online: ${adminManualOverride ? `manual (${adminManualOverride})` : 'automático'}\n` +
+                   `Presencia real: ${adminOnline ? '✅' : '❌'}\n` +
+                   `Pausa manual: ${adminPaused ? '⏸️' : '▶️'}\n` +
+                   `Disponible para pedidos: ${(effectiveOnline && !adminPaused) ? '✅' : '❌'}`;
     await sock.sendMessage(remoteJid, { text: estado });
     return true;
   }
 
+  // Modo negocio
   if (plainLower === '!modo recarga') {
     businessMode = true;
     await sock.sendMessage(remoteJid, { text: '✅ Modo negocio activado. Puedes añadir o editar productos. (Pero no te confíes, que igual puedo sabotear algo... es broma... o no 😈)' });
@@ -1590,7 +1638,8 @@ async function handlePrivateCustomer(msg, participant, pushName, messageText, re
     session.step = 'confirm_payment';
     userSessions.set(participant, session);
 
-    const adminAvailable = adminOnline && !adminPaused;
+    const effectiveOnline = adminManualOverride !== null ? (adminManualOverride === 'online') : adminOnline;
+    const adminAvailable = effectiveOnline && !adminPaused;
     if (!adminAvailable) {
       await sock.sendMessage(remoteJid, { text: '⏳ El administrador no está disponible en este momento. Puedes dejar tu pedido y se procesará cuando él se conecte. ¿Quieres continuar? (Responde "si" para dejar el pedido en espera o "no" para cancelar)' });
       session.step = 'awaiting_offline_confirmation';
@@ -1901,9 +1950,12 @@ async function startBot() {
       const presence = presences[id];
       if (presence) {
         const wasOnline = adminOnline;
-        adminOnline = presence.lastKnownPresence === 'available';
+        // Solo actualizar si no hay override manual
+        if (adminManualOverride === null) {
+          adminOnline = presence.lastKnownPresence === 'available';
+        }
         if (wasOnline !== adminOnline) {
-          console.log(`Admin ${adminOnline ? 'conectado' : 'desconectado'}`);
+          console.log(`Admin ${adminOnline ? 'conectado' : 'desconectado'} (presencia)`);
           if (adminOnline) {
             processPendingOfflineOrders();
           }
