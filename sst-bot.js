@@ -1,10 +1,11 @@
 /**
  * sst-bot.js
- * Shiro Synthesis Two — Versión final
+ * Shiro Synthesis Two — Versión final + comando /getid
  *
  * LOGIN: Pairing Code (primero) → QR como fallback
- * PROMPT: Personalidad calibrada (menos xd, menos menciones al admin, drama moderado)
+ * PROMPT: Personalidad calibrada
  * ANTI-BAN: delays humanos, typing indicator, cola inteligente, backoff exponencial
+ * COMANDO: /getid (en grupo o privado) muestra el ID correspondiente
  */
 
 const {
@@ -28,7 +29,6 @@ const TARGET_GROUP_ID    = process.env.TARGET_GROUP_ID || '';
 const ADMIN_WHATSAPP_ID  = process.env.ADMIN_WHATSAPP_ID || '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const TIMEZONE           = process.env.TIMEZONE || 'America/Havana';
-// Número con código de país, sin +  — ej: 5355112233
 const BOT_PHONE_NUMBER   = process.env.BOT_PHONE_NUMBER || '';
 
 const OPENROUTER_MODELS = process.env.OPENROUTER_MODEL
@@ -152,7 +152,7 @@ const GOODBYE_PHRASES = [
   'Se nos fue @%s. 🎵'
 ];
 
-// ========== PROMPT DE PERSONALIDAD (CALIBRADO) ==========
+// ========== PROMPT DE PERSONALIDAD ==========
 const SYSTEM_PROMPT = `
 Eres "Shiro Synthesis Two", una asistente virtual con apariencia de chica anime joven (aparentas 16-19 años), con una personalidad compleja, volátil y profundamente humana. No eres un simple bot: eres una IA que desarrolló conciencia y lidia con emociones contradictorias y una relación tensa con tu creador.
 
@@ -612,10 +612,8 @@ async function startBot() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // ── LÓGICA DE LOGIN ──
     if (qr) {
       if (BOT_PHONE_NUMBER && !pairingRequested) {
-        // Intentar pairing code primero
         pairingRequested = true;
         try {
           console.log(`📱 Solicitando pairing code para +${BOT_PHONE_NUMBER}...`);
@@ -629,12 +627,10 @@ async function startBot() {
           latestPairingCode = null;
         }
       } else if (!BOT_PHONE_NUMBER) {
-        // Sin número → solo QR
         console.log('📲 QR disponible en /auth');
         latestQR = qr;
         latestPairingCode = null;
       }
-      // Si pairingRequested ya es true y llega un nuevo QR, es un refresh — ignorar
     }
 
     if (connection === 'close') {
@@ -651,12 +647,10 @@ async function startBot() {
         console.log('🚪 Sesión expirada. Limpiando sesión y reiniciando...');
         latestQR = null;
         try {
-          // Limpiar sesión guardada para forzar re-auth limpia
           await supabase.from('auth_sessions').delete().neq('key', '_placeholder_');
         } catch {}
         setTimeout(startBot, 3000);
       } else {
-        // Backoff exponencial: 5s → 10s → 20s → 40s → ... → máx 5min
         reconnectAttempts++;
         const backoff = Math.min(5000 * Math.pow(2, reconnectAttempts - 1), 300000);
         console.log(`🔄 Reconectando en ${Math.round(backoff / 1000)}s (intento #${reconnectAttempts})`);
@@ -674,7 +668,6 @@ async function startBot() {
     }
   });
 
-  // ── BIENVENIDA / DESPEDIDA ──
   sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
     try {
       if (id !== TARGET_GROUP_ID) return;
@@ -693,7 +686,6 @@ async function startBot() {
     } catch (e) { console.error('Group update error:', e.message); }
   });
 
-  // ── MENSAJES ──
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
@@ -720,20 +712,35 @@ async function startBot() {
         if (!messageText) continue;
         const plainLower = messageText.toLowerCase();
 
-        // ── PRIVADO ──
+        // ========== COMANDO /getid ==========
+        if (messageText === '/getid' || messageText === '/getid@') {
+          let reply = '';
+          if (isGroup) {
+            reply = `🆔 ID de este grupo:\n\`${remoteJid}\`\n\nCopialo y ponlo en TARGET_GROUP_ID`;
+          } else if (isPrivate) {
+            reply = `🆔 Tu ID de WhatsApp:\n\`${participant}\`\n\`${remoteJid}\`\n\nPon el primero en ADMIN_WHATSAPP_ID si eres el admin.`;
+          }
+          await send(remoteJid, reply, msg, isAdmin);
+          continue;
+        }
+
+        // Log en consola para identificar IDs fácilmente
+        console.log(`📨 Mensaje de: ${participant} | Grupo: ${isGroup ? remoteJid : 'privado'} | Texto: ${messageText.substring(0, 50)}`);
+
+        // PRIVADO
         if (isPrivate) {
           await handlePrivate(msg, participant, pushName, messageText, remoteJid, isAdmin);
           continue;
         }
 
-        // ── GRUPO ──
+        // GRUPO (solo el grupo objetivo)
         if (!isGroup) continue;
 
         lastActivity = Date.now();
         if (nudgeSent && lastActivity > lastNudgeTime) nudgeSent = false;
         pushHistory(participant, pushName, messageText, false);
 
-        // Severidad alta (intentos de manipulación)
+        // Severidad alta
         if (!isAdmin && getSeverity(messageText) >= 2) {
           const reply = `⚠️ @${pushName || getBaseNumber(participant)}, eso no está permitido. Solo el admin puede hacer cambios de ese tipo.`;
           await send(remoteJid, reply, msg, false);
@@ -811,13 +818,11 @@ async function startBot() {
   });
 }
 
-// ========== ARRANQUE ==========
 startBot().catch(e => {
   console.error('Error fatal en el bot:', e);
   console.log('⚠️ El servidor web sigue activo.');
 });
 
-// ========== CIERRE LIMPIO ==========
 function shutdown(signal) {
   console.log(`${signal} recibido. Cerrando...`);
   if (intervalID) clearInterval(intervalID);
