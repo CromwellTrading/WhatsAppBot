@@ -1,24 +1,23 @@
 {
   "name": "shiro-synthesis-two",
   "version": "2.0.0",
-  "description": "Bot de WhatsApp con personalidad avanzada, moderación y pairing code",
+  "private": true,
+  "description": "Bot de WhatsApp Shiro Synthesis Two para la comunidad Bolita Cubana",
   "main": "sst-bot.js",
   "scripts": {
     "start": "node sst-bot.js",
-    "dev": "nodemon sst-bot.js"
-  },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
-    "@whiskeysockets/baileys": "^6.6.0",
-    "axios": "^1.6.2",
-    "express": "^4.18.2",
-    "pino": "^8.17.2",
-    "qrcode": "^1.5.3"
+    "check": "node --check sst-bot.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20 <21"
   },
-  "keywords": ["whatsapp", "bot", "baileys", "ai", "openrouter"],
-  "author": "Asche Synthesis",
-  "license": "MIT"
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "axios": "^1.11.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "pino": "^9.9.0",
+    "qrcode": "^1.5.4"
+  }
 }

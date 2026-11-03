@@ -1,7 +1,7 @@
 node_modules/
-.wwebjs_auth/
-.session-store/
-*.log
-warnings.json
-posts.json
 .env
+/data/
+auth_info/
+*.log
+npm-debug.log*
+.DS_Store
